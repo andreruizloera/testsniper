@@ -1,0 +1,44 @@
+[project]
+name = "testsniper"
+version = "0.1.0"
+description = "Run the tests your code change can actually affect."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andre Ruiz Loera", email = "andre.x.ruizloera@gmail.com" }]
+dependencies = []
+keywords = ["pytest", "testing", "test-selection", "ci", "developer-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Repository = "https://github.com/andreruizloera/testsniper"
+Issues = "https://github.com/andreruizloera/testsniper/issues"
+
+[project.scripts]
+testsniper = "testsniper.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["examples/fixture_project"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RET"]
