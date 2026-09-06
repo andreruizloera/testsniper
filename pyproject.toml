@@ -22,8 +22,16 @@ classifiers = [
 Repository = "https://github.com/andreruizloera/testsniper"
 Issues = "https://github.com/andreruizloera/testsniper/issues"
 
+[project.optional-dependencies]
+# The pytest plugin is the only part that needs pytest. The command-line tool
+# invokes the target project's pytest as a subprocess and imports nothing.
+pytest = ["pytest>=8.0"]
+
 [project.scripts]
 testsniper = "testsniper.cli:main"
+
+[project.entry-points.pytest11]
+testsniper = "testsniper.plugin"
 
 [build-system]
 requires = ["hatchling>=1.26"]
@@ -38,7 +46,10 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["examples/fixture_project"]
+# The example projects are inputs to the tool, not part of it. They are meant
+# to read like ordinary user code, including import layouts ruff cannot
+# resolve from here (their packages are only importable from their own root).
+extend-exclude = ["examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RET"]

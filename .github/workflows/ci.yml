@@ -24,3 +24,7 @@ jobs:
         run: uv run ruff check .
       - name: Tests
         run: uv run pytest -q
+      - name: Demo
+        # The README pastes this script's output, so a drift between the two
+        # should break the build rather than sit in the docs.
+        run: uv run bash demo.sh

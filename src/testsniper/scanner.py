@@ -97,7 +97,9 @@ def parse_module(root: Path, relpath: Path) -> ModuleInfo:
             for alias in node.names:
                 info.deps |= _expand_prefixes(alias.name)
         elif isinstance(node, ast.ImportFrom):
-            full = _resolve_from(node, pkg_parts, info)
+            full, unresolved = resolve_from(node, pkg_parts)
+            if unresolved:
+                info.unresolved_relative = True
             if full is None:
                 continue
             info.deps |= _expand_prefixes(full)
@@ -115,20 +117,24 @@ def parse_module(root: Path, relpath: Path) -> ModuleInfo:
     return info
 
 
-def _resolve_from(node: ast.ImportFrom, pkg_parts: list[str], info: ModuleInfo) -> str | None:
-    """Resolve a from-import to a dotted name, handling relative levels."""
+def resolve_from(node: ast.ImportFrom, pkg_parts: list[str]) -> tuple[str | None, bool]:
+    """Resolve a from-import to a dotted name, handling relative levels.
+
+    Returns the dotted name and whether resolution failed. A relative import
+    that climbs past the package root, or one whose target resolves to
+    nothing, is unresolved: the caller should treat it as a blind spot rather
+    than as an absent dependency.
+    """
     if node.level == 0:
-        return node.module
+        return node.module, False
     drop = node.level - 1
     if drop > len(pkg_parts):
-        info.unresolved_relative = True
-        return None
+        return None, True
     base = pkg_parts[: len(pkg_parts) - drop]
     target = [*base, *(node.module.split(".") if node.module else [])]
     if not target:
-        info.unresolved_relative = True
-        return None
-    return ".".join(target)
+        return None, True
+    return ".".join(target), False
 
 
 def scan_repo(root: Path) -> dict[str, ModuleInfo]:

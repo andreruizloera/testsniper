@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+# The plugin tests run pytest inside pytest. They deliberately do not pass
+# "-p testsniper.plugin" to the inner run, so a broken pytest11 entry point
+# fails this suite instead of hiding behind an explicit load.
+pytest_plugins = ["pytester"]
+
 GIT_ENV_ARGS = [
     "-c",
     "user.name=Test",

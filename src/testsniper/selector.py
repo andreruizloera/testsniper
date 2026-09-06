@@ -47,6 +47,15 @@ class Selection:
     notes: list[str] = field(default_factory=list)
     confidence: str = "High"
     confidence_reasons: list[str] = field(default_factory=list)
+    # Everything downstream of the change: the files in the reverse-import
+    # closure, and the dotted names they are importable as (plus the names of
+    # deleted modules, which have no file left to name them). Node-level
+    # narrowing needs this to tell an affected import from an innocent one.
+    affected_files: set[str] = field(default_factory=set)
+    affected_modules: set[str] = field(default_factory=set)
+    # Every test file that was considered, selected or not. A test in a file
+    # that never entered the index was never judged, so it must not be dropped.
+    indexed: list[str] = field(default_factory=list)
 
     def degrade(self, level: str, reason: str) -> None:
         if _LEVELS[level] > _LEVELS[self.confidence]:
@@ -72,6 +81,7 @@ def select(
     sel = Selection(changed=changed)
     sel.total_test_files = len(test_rels)
     sel.total_tests = sum(counts.values())
+    sel.indexed = list(test_rels)
     if not changed:
         return sel
 
@@ -128,6 +138,9 @@ def select(
         sel.notes.append(f"{rel} was deleted; selecting tests for its importers")
 
     dist = reverse_closure(reverse, seeds)
+    sel.affected_files = set(dist)
+    sel.affected_modules = {infos[rel].module for rel in dist if rel in infos}
+    sel.affected_modules |= {module_name(root, Path(rel)) for rel in deleted}
     for rel, d in dist.items():
         if rel not in test_set:
             continue
