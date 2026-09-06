@@ -20,15 +20,26 @@ what it stops short of.
 ## Selection quality
 
 Test-node granularity shipped: `--nodes` and the `--testsniper` plugin
-select individual test functions. The items below are what it does not do
-yet.
+select individual test functions. The cross-file fixture graph shipped after
+it: an affected `conftest.py` no longer switches narrowing off for its whole
+subtree, because the fixtures the change actually reaches are resolved by
+name across the conftest chain. The items below are what neither does yet.
 
-- Cross-file fixture graph. Fixtures are followed inside a file today. A
-  fixture in a `conftest.py` is handled by refusing to narrow anything under
-  that conftest when it is affected, which is safe but blunt: resolving which
-  tests actually request that fixture would keep narrowing on for the rest.
+- Select a test file that reaches the change ONLY through a conftest fixture.
+  File-level selection is by import, so a file importing nothing affected is
+  never selected and narrowing never sees it. The fixture graph now knows which
+  fixtures are affected, so the missing piece is deciding what selecting a
+  conftest's subtree should cost when node narrowing is off: without `--nodes`
+  it means running the subtree, and a root conftest that imports application
+  code would pull in the whole suite on every change. Probably wants the
+  subtree added only when a fixture is genuinely affected, and a confidence
+  note when it happens.
 - Fixture awareness for plugin-provided fixtures, which no amount of AST
-  reading can attribute to a test.
+  reading can attribute to a test. `pytest_plugins` is a refusal today; an
+  installed plugin's fixtures are invisible.
+- Decide whether a test file's own fixture cleanly overrides an affected
+  conftest fixture of the same name. Today the name stays marked affected,
+  which over-selects that file's tests.
 - Diff-hunk narrowing for a changed test file. Today a changed test file runs
   in full; the diff says which functions moved.
 - Narrow on the changed symbol, not just the changed module: a test that uses

@@ -81,7 +81,7 @@ def test_nodes_list_names_the_selected_functions(mixed_repo: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
     assert "would run 7 of 16 tests" in out
-    assert "7 of 13 tests: narrowed by name usage" in out
+    assert "7 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
     # Reached directly, and through the taxed_total fixture respectively.
     assert "test_price_with_tax_rounds_half_up" in out
     assert "test_receipt_shows_the_taxed_total" in out
@@ -97,7 +97,10 @@ def test_plugin_narrows_a_plain_pytest_invocation(mixed_repo: Path) -> None:
     out = proc.stdout
     assert "testsniper: default mode, working tree vs HEAD" in out
     assert "selected 8 of 20 collected tests" in out
-    assert "tests/test_checkout.py: 8 of 14, narrowed by name usage" in out
+    assert (
+        "tests/test_checkout.py: 8 of 14, narrowed by name usage"
+        " and 1 affected conftest fixture" in out
+    )
     assert "8 passed, 12 deselected" in out
 
 
@@ -121,20 +124,48 @@ def test_changing_the_test_file_itself_runs_all_of_it(mixed_repo: Path) -> None:
     assert "all tests: the test file itself changed" in proc.stdout
 
 
-def test_an_affected_conftest_stops_narrowing_in_its_subtree(mixed_repo: Path) -> None:
-    """A conftest that imports the change can inject it into any test there."""
-    (mixed_repo / "tests" / "conftest.py").write_text(
-        "import pytest\n"
-        "\n"
-        "from store.pricing import TAX_RATE\n"
-        "\n"
-        "@pytest.fixture(autouse=True)\n"
-        "def _rate():\n"
-        "    return TAX_RATE\n"
-    )
-    git(mixed_repo, "add", "-A")
-    git(mixed_repo, "commit", "-q", "-m", "add conftest")
+def test_an_affected_conftest_fixture_is_followed_across_files(mixed_repo: Path) -> None:
+    """The committed conftest is affected by a pricing change.
+
+    Only its taxed_total fixture reaches pricing, so narrowing continues and
+    the one test that requests that fixture is selected through it, even
+    though test_checkout.py never imports tests/conftest.py.
+    """
     _change_pricing(mixed_repo)
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "all tests: tests/conftest.py is affected and its fixtures apply here" in proc.stdout
+    out = proc.stdout
+    assert "7 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
+    assert "test_receipt_shows_the_taxed_total" in out
+    # basket is a conftest fixture too, and a pricing change does not reach it.
+    assert "test_receipt_lists_every_line" not in out
+
+
+def test_an_affected_autouse_conftest_fixture_stops_narrowing(mixed_repo: Path) -> None:
+    """A change to receipts reaches the autouse fixture, which runs for all."""
+    receipts = mixed_repo / "store" / "receipts.py"
+    receipts.write_text(
+        receipts.read_text() + '\n\ndef render_footer(note: str) -> str:\n    return f"-- {note}"\n'
+    )
+    proc = _run(mixed_repo, "--nodes", "--list")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = proc.stdout
+    assert "would run 13 of 16 tests" in out
+    assert (
+        "all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change" in out
+    )
+
+
+def test_module_level_code_in_a_conftest_stops_narrowing(mixed_repo: Path) -> None:
+    """Import-time code in a conftest can configure state no test names."""
+    (mixed_repo / "tests" / "conftest.py").write_text(
+        "from store.pricing import TAX_RATE\n\nRATE_PERCENT = TAX_RATE * 100\n"
+    )
+    git(mixed_repo, "add", "-A")
+    git(mixed_repo, "commit", "-q", "-m", "replace conftest")
+    _change_pricing(mixed_repo)
+    proc = _run(mixed_repo, "--nodes", "--list")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (
+        "all tests: module-level code in tests/conftest.py uses an affected import" in proc.stdout
+    )

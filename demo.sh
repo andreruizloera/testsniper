@@ -7,6 +7,9 @@
 # Part 2 uses the mixed project, where one test file's tests use different
 # modules, to show node-level selection: the same change reaches only part of
 # that file, and the pytest plugin drops the rest at collection time.
+#
+# Part 3 stays in the mixed project and changes a module that its conftest's
+# autouse fixture reaches, so narrowing correctly gives up and says why.
 set -euo pipefail
 
 if ! command -v testsniper >/dev/null 2>&1; then
@@ -53,7 +56,36 @@ echo "\$ testsniper --list"
 testsniper --list
 echo
 echo "\$ testsniper --nodes --list"
-testsniper --nodes --list
+nodes_out="$(testsniper --nodes --list)"
+echo "$nodes_out"
 echo
 echo "\$ pytest --testsniper"
 python -m pytest --testsniper
+
+echo
+echo "### Part 3: a fixture the test file never imports"
+echo
+echo "The pricing change above reaches tests/conftest.py, which the checkout"
+echo "tests do not import. Only its taxed_total fixture reaches pricing, so"
+echo "narrowing follows that one fixture instead of giving up on the directory."
+echo
+git checkout -q -- store/pricing.py
+printf '\n\ndef render_footer(note: str) -> str:\n    return f"-- {note}"\n' \
+    >> store/receipts.py
+echo "\$ testsniper --nodes --list   # after changing store/receipts.py instead"
+autouse_out="$(testsniper --nodes --list)"
+echo "$autouse_out"
+
+# The README pastes these lines. Fail loudly rather than let them drift.
+expect() {
+    if ! printf '%s' "$1" | grep -qF -- "$2"; then
+        echo
+        echo "DEMO FAILED: expected to find: $2"
+        exit 1
+    fi
+}
+expect "$nodes_out" "7 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+expect "$nodes_out" "test_receipt_shows_the_taxed_total"
+expect "$autouse_out" "all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change"
+echo
+echo "Demo checks passed."

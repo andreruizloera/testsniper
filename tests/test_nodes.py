@@ -29,9 +29,12 @@ def _narrow(
     affected: set[str] | None = None,
     relpath: str = "tests/test_it.py",
     module: str = "test_it",
+    fixtures: set[str] | None = None,
 ) -> FileNodes:
     write_tree(tmp_path, {relpath: source})
-    return narrow_file(tmp_path, relpath, affected or {"pkg.changed"}, module)
+    return narrow_file(
+        tmp_path, relpath, affected or {"pkg.changed"}, module, fixtures=fixtures or set()
+    )
 
 
 def _names(nodes: FileNodes) -> set[str]:
@@ -451,6 +454,164 @@ def test_relative_import_inside_a_package_resolves(tmp_path: Path) -> None:
     assert _names(nodes) == {"test_a"}
 
 
+def test_a_seeded_conftest_fixture_selects_the_tests_that_request_it(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "def test_a(cart):\n    assert cart\n\ndef test_b(name):\n    assert name\n",
+        affected={"pkg.changed"},
+        fixtures={"cart"},
+    )
+    assert nodes.narrowed
+    assert nodes.reason == "narrowed by name usage and 1 affected conftest fixture"
+    assert _names(nodes) == {"test_a"}
+
+
+def test_a_local_fixture_requesting_a_seeded_one_propagates(tmp_path: Path) -> None:
+    """The file's own fixture is the bridge to the conftest's."""
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def wrapped(cart):\n"
+        "    return cart\n"
+        "\n"
+        "def test_a(wrapped):\n"
+        "    assert wrapped\n"
+        "\n"
+        "def test_b():\n"
+        "    assert True\n",
+        fixtures={"cart"},
+    )
+    assert _names(nodes) == {"test_a"}
+
+
+def test_two_seeded_fixtures_are_counted_in_the_reason(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "def test_a(cart):\n    assert cart\n",
+        fixtures={"cart", "basket"},
+    )
+    assert nodes.reason == "narrowed by name usage and 2 affected conftest fixtures"
+
+
+def test_a_usefixtures_mark_requests_a_fixture_by_string(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        '@pytest.mark.usefixtures("cart")\n'
+        "def test_a():\n"
+        "    assert True\n"
+        "\n"
+        "def test_b():\n"
+        "    assert True\n",
+        fixtures={"cart"},
+    )
+    assert _names(nodes) == {"test_a"}
+
+
+def test_a_usefixtures_mark_on_a_class_covers_its_methods(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        '@pytest.mark.usefixtures("cart")\n'
+        "class TestOne:\n"
+        "    def test_a(self):\n"
+        "        assert True\n"
+        "\n"
+        "class TestTwo:\n"
+        "    def test_b(self):\n"
+        "        assert True\n",
+        fixtures={"cart"},
+    )
+    assert _names(nodes) == {"test_a"}
+
+
+def test_an_autouse_fixture_in_the_file_stops_narrowing(tmp_path: Path) -> None:
+    """It runs for tests that never name it, so none of them can be dropped."""
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        "from pkg.changed import build\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def _setup():\n"
+        "    build()\n"
+        "\n"
+        "def test_a():\n"
+        "    assert True\n",
+    )
+    assert not nodes.narrowed
+    assert nodes.reason == "autouse fixture _setup in this file uses an affected import"
+
+
+def test_an_autouse_fixture_that_misses_the_change_still_narrows(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        "from pkg.changed import build\n"
+        "from pkg.other import quiet\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def _setup():\n"
+        "    quiet()\n"
+        "\n"
+        "def test_a():\n"
+        "    assert build()\n"
+        "\n"
+        "def test_b():\n"
+        "    assert True\n",
+    )
+    assert nodes.narrowed
+    assert _names(nodes) == {"test_a"}
+
+
+def test_a_class_level_autouse_fixture_selects_only_that_class(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        "from pkg.changed import build\n"
+        "\n"
+        "class TestHot:\n"
+        "    @pytest.fixture(autouse=True)\n"
+        "    def _setup(self):\n"
+        "        build()\n"
+        "\n"
+        "    def test_a(self):\n"
+        "        assert True\n"
+        "\n"
+        "class TestCold:\n"
+        "    def test_b(self):\n"
+        "        assert True\n"
+        "\n"
+        "def test_c():\n"
+        "    assert True\n",
+    )
+    assert nodes.narrowed
+    assert nodes.selected == {("TestHot", "test_a")}
+
+
+def test_getfixturevalue_stops_narrowing(tmp_path: Path) -> None:
+    """A fixture named by a string is a name this analysis cannot follow."""
+    nodes = _narrow(
+        tmp_path,
+        "from pkg.changed import build\n"
+        "\n"
+        "def test_a(request):\n"
+        '    request.getfixturevalue("thing")\n'
+        "\n"
+        "def test_b():\n"
+        "    assert build()\n",
+    )
+    assert not nodes.narrowed
+    assert nodes.reason == "the file reads names dynamically (request.getfixturevalue)"
+
+
 def test_is_affected_prefix_and_submodule_rules() -> None:
     affected = {"pkg.changed"}
     assert is_affected("pkg.changed", affected)
@@ -498,7 +659,8 @@ def test_transitive_importers_narrow_on_the_module_they_import(sample_project: P
     assert {name for _cls, name in top.selected} == {"test_top"}
 
 
-def test_an_affected_conftest_stops_narrowing_in_its_subtree(sample_project: Path) -> None:
+def test_module_level_code_in_an_affected_conftest_stops_narrowing(sample_project: Path) -> None:
+    """Import-time code in a conftest can configure state no test names."""
     write_tree(
         sample_project,
         {"tests/conftest.py": "from pkg.core import core\n\nRATE = core()\n"},
@@ -506,7 +668,88 @@ def test_an_affected_conftest_stops_narrowing_in_its_subtree(sample_project: Pat
     _sel, nodes = _selection_nodes(sample_project, ["pkg/core.py"])
     entry = nodes["tests/test_core.py"]
     assert not entry.narrowed
-    assert entry.reason == "tests/conftest.py is affected and its fixtures apply here"
+    assert entry.reason == "module-level code in tests/conftest.py uses an affected import"
+
+
+def test_an_affected_conftest_fixture_narrows_instead_of_stopping(sample_project: Path) -> None:
+    """The caveat this feature removed: one affected fixture, not a subtree."""
+    write_tree(
+        sample_project,
+        {
+            "tests/conftest.py": (
+                "import pytest\n"
+                "\n"
+                "from pkg.core import core\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def rate():\n"
+                "    return core()\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def name():\n"
+                "    return 'ada'\n"
+            ),
+            "tests/test_mixed.py": (
+                "from pkg.core import core\n"
+                "\n"
+                "def test_uses_the_import():\n"
+                "    assert core()\n"
+                "\n"
+                "def test_uses_the_hot_fixture(rate):\n"
+                "    assert rate\n"
+                "\n"
+                "def test_uses_the_cold_fixture(name):\n"
+                "    assert name\n"
+            ),
+        },
+    )
+    _sel, nodes = _selection_nodes(sample_project, ["pkg/core.py"])
+    entry = nodes["tests/test_mixed.py"]
+    assert entry.narrowed
+    assert entry.reason == "narrowed by name usage and 1 affected conftest fixture"
+    assert {name for _cls, name in entry.selected} == {
+        "test_uses_the_import",
+        "test_uses_the_hot_fixture",
+    }
+    # The file that imports the change directly is unaffected by any of this.
+    assert nodes["tests/test_core.py"].narrowed
+
+
+def test_an_affected_autouse_conftest_fixture_stops_narrowing(sample_project: Path) -> None:
+    write_tree(
+        sample_project,
+        {
+            "tests/conftest.py": (
+                "import pytest\n"
+                "\n"
+                "from pkg.core import core\n"
+                "\n"
+                "@pytest.fixture(autouse=True)\n"
+                "def _warm():\n"
+                "    core()\n"
+            )
+        },
+    )
+    _sel, nodes = _selection_nodes(sample_project, ["pkg/core.py"])
+    entry = nodes["tests/test_core.py"]
+    assert not entry.narrowed
+    assert entry.reason == "autouse fixture _warm in tests/conftest.py reaches the change"
+
+
+def test_an_unaffected_conftest_leaves_narrowing_alone(sample_project: Path) -> None:
+    """No conftest in the chain is affected, so the graph never runs."""
+    write_tree(
+        sample_project,
+        {
+            "tests/conftest.py": (
+                "import pytest\n\n@pytest.fixture\ndef name():\n    return 'ada'\n"
+            )
+        },
+    )
+    _sel, nodes = _selection_nodes(sample_project, ["pkg/core.py"])
+    entry = nodes["tests/test_core.py"]
+    assert entry.narrowed
+    assert entry.reason == "narrowed by name usage"
 
 
 def test_conftests_for_lists_every_applicable_directory() -> None:

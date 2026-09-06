@@ -3,6 +3,9 @@
 Deliberately mixed: some tests use pricing, some use shipping, some only
 format text. File-level selection has to run all of them when pricing
 changes. Node-level selection does not.
+
+The `basket` and `taxed_total` fixtures live in tests/conftest.py, so the
+tests that use them reach pricing through a file this one never imports.
 """
 
 import pytest
@@ -11,19 +14,6 @@ from store.orders import order_total, subtotal
 from store.pricing import line_total, price_with_tax
 from store.receipts import format_cents, render_receipt
 from store.shipping import shipping_cost
-
-BASKET = [("widget", 500, 2), ("gizmo", 250, 1)]
-
-
-@pytest.fixture
-def basket():
-    return list(BASKET)
-
-
-@pytest.fixture
-def taxed_total(basket):
-    """Reaches pricing through orders, so the tests that ask for it do too."""
-    return order_total(basket)
 
 
 def test_price_with_tax_rounds_half_up():
