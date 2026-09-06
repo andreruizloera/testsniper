@@ -14,7 +14,6 @@ from conftest import write_tree
 from testsniper.config import load_config
 from testsniper.nodes import (
     FileNodes,
-    conftests_for,
     is_affected,
     narrow_file,
     narrow_selection,
@@ -750,12 +749,3 @@ def test_an_unaffected_conftest_leaves_narrowing_alone(sample_project: Path) -> 
     entry = nodes["tests/test_core.py"]
     assert entry.narrowed
     assert entry.reason == "narrowed by name usage"
-
-
-def test_conftests_for_lists_every_applicable_directory() -> None:
-    assert conftests_for("tests/unit/test_it.py") == [
-        "conftest.py",
-        "tests/conftest.py",
-        "tests/unit/conftest.py",
-    ]
-    assert conftests_for("test_it.py") == ["conftest.py"]

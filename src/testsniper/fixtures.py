@@ -1,4 +1,5 @@
-"""Cross-file fixture graph: which conftest fixtures reach the change.
+"""Cross-file fixture graph: which conftest fixtures reach the change, and
+which test files ask for them.
 
 A test's fixtures are not all in its file. pytest resolves each test parameter
 against every applicable ``conftest.py``, nearest first, so a change can reach
@@ -13,7 +14,10 @@ This module asks the narrower question. It reads the conftest chain that
 applies to a file, resolves fixture names across it the way pytest does
 (nearest definition wins, and an override that requests its own name means the
 one it overrode), and returns the fixture names that reach the change. Those
-names go back to ``nodes.py`` to be treated exactly like an affected import.
+names go back to ``nodes.py`` to be treated exactly like an affected import,
+and to ``selector.py``, which uses ``file_requests`` below to find the test
+files that ask for one of them without importing anything affected. Those
+files are invisible to an import graph: the fixture is the only channel.
 
 It refuses, for the whole chain, when a conftest does something that applies to
 every test underneath it regardless of what any test requests:
@@ -38,7 +42,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from testsniper.scanner import ModuleInfo
 from testsniper.usage import (
@@ -212,3 +216,56 @@ def analyze_conftests(
 
     tainted = {name for name, (depth, func) in visible.items() if reached(depth, func)}
     return FixtureVerdict(tainted=frozenset(tainted))
+
+
+def conftests_for(relpath: str) -> list[str]:
+    """Every conftest.py path that pytest would apply to a test file.
+
+    Outermost first, which is the order pytest resolves fixture names in and
+    the order ``analyze_conftests`` expects.
+    """
+    parts = PurePosixPath(relpath).parts[:-1]
+    out = ["conftest.py"]
+    for i in range(1, len(parts) + 1):
+        out.append("/".join([*parts[:i], "conftest.py"]))
+    return out
+
+
+@dataclass(frozen=True)
+class FileRequest:
+    """Which of a set of fixture names a test file can ask for."""
+
+    requested: frozenset[str] = frozenset()
+    # Set when the file could not be read well enough to tell. Every name was
+    # then reported as requested, because the safe answer to "does this file
+    # use the changed fixture" is yes.
+    unreadable: str | None = None
+
+
+def file_requests(root: Path, relpath: str, module: str, names: frozenset[str]) -> FileRequest:
+    """Which of ``names`` a test file can request.
+
+    Deliberately coarser than the per-test analysis in ``nodes.py``: this
+    decides whether a FILE is worth selecting at all, so it asks whether the
+    name is read anywhere in it, by any test, fixture, helper, or mark. Node
+    narrowing then decides which of its tests actually reach the fixture. A
+    file this cannot read reports every name, so it is selected and its
+    reason is decided by the narrower, which reads it again and refuses.
+    """
+    if not names:
+        return FileRequest()
+    try:
+        source = (root / relpath).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=relpath)
+    except (SyntaxError, ValueError, OSError):
+        return FileRequest(names, f"{relpath} could not be parsed")
+
+    index = index_module(tree, package_parts(relpath, module), set())
+    if index.module_usage.opaque:
+        why = index.module_usage.opaque_why
+        return FileRequest(names, f"{relpath} reads names dynamically ({why})")
+
+    read: set[str] = set(index.module_usage.names)
+    for deps in index.defs.values():
+        read |= deps
+    return FileRequest(frozenset(names & read))

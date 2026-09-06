@@ -79,8 +79,7 @@ def _print_list(sel: Selection, nodes: dict[str, FileNodes] | None) -> None:
         would_run -= sum(n.dropped for n in nodes.values())
     print(f"Selected (would run {_fmt(would_run)} of {_fmt(sel.total_tests)} tests):")
     for test in sel.tests:
-        where = "always" if test.distance is None else f"distance {test.distance}"
-        print(f"  {test.relpath}  [{where}] {test.reason}")
+        print(f"  {test.relpath}  [{test.channel}] {test.reason}")
         if nodes is None:
             continue
         file_nodes = nodes.get(test.relpath)

@@ -1,9 +1,9 @@
 """Test-node granularity: which test functions in a file reach the change.
 
 File-level selection answers "can this test file reach the change at all,
-through imports". This module answers the narrower question inside one
-already-selected file: which of its test functions actually use the imports
-that were affected.
+through an import or through a conftest fixture". This module answers the
+narrower question inside one already-selected file: which of its test
+functions actually use what was affected.
 
 The analysis is name usage over the file's own AST. It resolves each
 module-level import to a dotted module name, marks the bindings whose target
@@ -33,7 +33,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from testsniper.fixtures import analyze_conftests
+from testsniper.fixtures import analyze_conftests, conftests_for
 from testsniper.scanner import ModuleInfo
 from testsniper.selector import Selection
 from testsniper.usage import (
@@ -206,15 +206,6 @@ def narrow_file(
     return nodes
 
 
-def conftests_for(relpath: str) -> list[str]:
-    """Every conftest.py path that pytest would apply to a test file."""
-    parts = PurePosixPath(relpath).parts[:-1]
-    out = ["conftest.py"]
-    for i in range(1, len(parts) + 1):
-        out.append("/".join([*parts[:i], "conftest.py"]))
-    return out
-
-
 def narrow_selection(
     root: Path,
     selection: Selection,
@@ -224,11 +215,16 @@ def narrow_selection(
 
     Files selected for a reason the analysis cannot refine (the test file
     itself changed, always_run, a changed conftest subtree) keep all of their
-    tests. When a conftest that applies to a file is itself affected, the
-    fixture graph decides: if the change reaches that conftest only through
-    fixtures, those fixture names are handed to ``narrow_file`` and narrowing
-    continues; if it reaches something that applies to every test underneath
-    regardless of what any test names, narrowing is refused with that reason.
+    tests; the selection marks those ``narrowable=False``. When a conftest
+    that applies to a file is itself affected, the fixture graph decides: if
+    the change reaches that conftest only through fixtures, those fixture
+    names are handed to ``narrow_file`` and narrowing continues; if it reaches
+    something that applies to every test underneath regardless of what any
+    test names, narrowing is refused with that reason.
+
+    The verdicts are the ones selection already computed, when it computed
+    them, so the file-level and node-level answers come from one reading of
+    the conftest chain rather than two.
     """
     out: dict[str, FileNodes] = {}
     if selection.select_all:
@@ -237,27 +233,31 @@ def narrow_selection(
         return out
 
     known_conftests = {rel for rel in infos if PurePosixPath(rel).name == "conftest.py"}
-    cache: dict[tuple[str, ...], tuple[frozenset[str], str | None]] = {}
 
     for test in selection.tests:
         rel = test.relpath
         if test.distance == 0:
             out[rel] = FileNodes(rel, False, "the test file itself changed")
             continue
-        if test.distance is None:
-            out[rel] = FileNodes(rel, False, test.reason)
-            continue
 
         chain = tuple(c for c in conftests_for(rel) if c in known_conftests)
         tainted: frozenset[str] = frozenset()
         if any(c in selection.affected_files for c in chain):
-            if chain not in cache:
-                verdict = analyze_conftests(root, list(chain), selection.affected_modules, infos)
-                cache[chain] = (verdict.tainted, verdict.block)
-            tainted, block = cache[chain]
-            if block is not None:
-                out[rel] = FileNodes(rel, False, block)
+            if chain not in selection.fixture_verdicts:
+                selection.fixture_verdicts[chain] = analyze_conftests(
+                    root, list(chain), selection.affected_modules, infos
+                )
+            verdict = selection.fixture_verdicts[chain]
+            # A block outranks the file's own selection reason: it is the more
+            # specific answer to "why is all of this file running".
+            if verdict.block is not None:
+                out[rel] = FileNodes(rel, False, verdict.block)
                 continue
+            tainted = verdict.tainted
+
+        if test.whole_file is not None:
+            out[rel] = FileNodes(rel, False, test.whole_file)
+            continue
 
         module = infos[rel].module if rel in infos else rel
         out[rel] = narrow_file(root, rel, selection.affected_modules, module, fixtures=tainted)

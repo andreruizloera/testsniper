@@ -11,7 +11,7 @@ from pathlib import Path
 
 from conftest import write_tree
 
-from testsniper.fixtures import analyze_conftests
+from testsniper.fixtures import FileRequest, analyze_conftests, conftests_for, file_requests
 from testsniper.scanner import scan_repo
 
 BASE: dict[str, str] = {
@@ -460,3 +460,80 @@ def test_an_outer_conftest_blocking_stops_the_whole_chain(tmp_path: Path) -> Non
         chain=["conftest.py", "tests/conftest.py"],
     )
     assert verdict.block == "module-level code in conftest.py uses an affected import"
+
+
+# The other half of the module: which test files ask for those fixture names.
+# Selection uses this to find the files an import graph cannot see.
+
+NAMES = frozenset({"hot", "warm"})
+
+
+def _requests(root: Path, source: str, names: frozenset[str] = NAMES) -> FileRequest:
+    write_tree(root, {**BASE, "tests/test_it.py": source})
+    return file_requests(root, "tests/test_it.py", "tests.test_it", names)
+
+
+def test_a_parameter_requests_the_fixture(tmp_path: Path) -> None:
+    request = _requests(tmp_path, "def test_a(hot) -> None:\n    assert hot\n")
+    assert request.requested == frozenset({"hot"})
+    assert request.unreadable is None
+
+
+def test_a_name_the_file_never_reads_is_not_requested(tmp_path: Path) -> None:
+    request = _requests(tmp_path, "def test_a(other) -> None:\n    assert other\n")
+    assert request.requested == frozenset()
+
+
+def test_a_fixture_in_the_file_passes_the_request_on(tmp_path: Path) -> None:
+    request = _requests(
+        tmp_path,
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def wrapper(warm):\n"
+        "    return warm\n"
+        "\n"
+        "def test_a(wrapper) -> None:\n"
+        "    assert wrapper\n",
+    )
+    assert request.requested == frozenset({"warm"})
+
+
+def test_a_method_on_a_class_requests_it_too(tmp_path: Path) -> None:
+    request = _requests(
+        tmp_path,
+        "class TestThings:\n    def test_a(self, hot) -> None:\n        assert hot\n",
+    )
+    assert request.requested == frozenset({"hot"})
+
+
+def test_an_unparseable_file_requests_everything(tmp_path: Path) -> None:
+    request = _requests(tmp_path, "def test_a(:\n")
+    assert request.requested == NAMES
+    assert request.unreadable == "tests/test_it.py could not be parsed"
+
+
+def test_getfixturevalue_makes_the_file_unreadable(tmp_path: Path) -> None:
+    request = _requests(
+        tmp_path,
+        'def test_a(request) -> None:\n    assert request.getfixturevalue("hot")\n',
+    )
+    assert request.requested == NAMES
+    assert request.unreadable is not None
+    assert "request.getfixturevalue" in request.unreadable
+
+
+def test_an_empty_name_set_reads_nothing(tmp_path: Path) -> None:
+    """No affected fixture means no reason to open the file at all."""
+    request = _requests(tmp_path, "def test_a(:\n", names=frozenset())
+    assert request.requested == frozenset()
+    assert request.unreadable is None
+
+
+def test_conftests_for_lists_the_chain_outermost_first() -> None:
+    assert conftests_for("tests/unit/test_it.py") == [
+        "conftest.py",
+        "tests/conftest.py",
+        "tests/unit/conftest.py",
+    ]
+    assert conftests_for("test_it.py") == ["conftest.py"]

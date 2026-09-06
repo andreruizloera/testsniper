@@ -60,8 +60,8 @@ def test_file_level_run_cannot_narrow_inside_the_file(mixed_repo: Path) -> None:
     proc = _run(mixed_repo)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Selected: tests/test_checkout.py" in proc.stdout
-    assert "Running 13 of 16 tests..." in proc.stdout
-    assert "14 passed" in proc.stdout
+    assert "Running 16 of 19 tests..." in proc.stdout
+    assert "17 passed" in proc.stdout
 
 
 def test_nodes_run_drops_the_tests_that_do_not_use_pricing(mixed_repo: Path) -> None:
@@ -69,9 +69,9 @@ def test_nodes_run_drops_the_tests_that_do_not_use_pricing(mixed_repo: Path) -> 
     proc = _run(mixed_repo, "--nodes")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "Running 7 of 16 tests (6 more dropped inside the selected files)..." in out
-    assert "8 passed, 6 deselected" in out
-    assert "Skipped: 9 (3 in unselected files, 6 deselected inside selected files)" in out
+    assert "Running 8 of 19 tests (8 more dropped inside the selected files)..." in out
+    assert "9 passed, 8 deselected" in out
+    assert "Skipped: 11 (3 in unselected files, 8 deselected inside selected files)" in out
     assert "Selection confidence: High" in out
 
 
@@ -80,7 +80,7 @@ def test_nodes_list_names_the_selected_functions(mixed_repo: Path) -> None:
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "would run 7 of 16 tests" in out
+    assert "would run 8 of 19 tests" in out
     assert "7 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
     # Reached directly, and through the taxed_total fixture respectively.
     assert "test_price_with_tax_rounds_half_up" in out
@@ -96,12 +96,12 @@ def test_plugin_narrows_a_plain_pytest_invocation(mixed_repo: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
     assert "testsniper: default mode, working tree vs HEAD" in out
-    assert "selected 8 of 20 collected tests" in out
+    assert "selected 9 of 23 collected tests" in out
     assert (
         "tests/test_checkout.py: 8 of 14, narrowed by name usage"
         " and 1 affected conftest fixture" in out
     )
-    assert "8 passed, 12 deselected" in out
+    assert "9 passed, 14 deselected" in out
 
 
 def test_changing_shipping_selects_a_different_slice(mixed_repo: Path) -> None:
@@ -113,7 +113,10 @@ def test_changing_shipping_selects_a_different_slice(mixed_repo: Path) -> None:
     # Both files import shipping; only the tests that use it survive.
     assert "tests/test_checkout.py: 2 of 14" in out
     assert "tests/test_shipping_rules.py: 6 of 6" not in out
-    assert "8 passed, 12 deselected" in out
+    # A shipping change reaches nothing in tests/conftest.py, so the file that
+    # is only reachable through a fixture is not selected at all.
+    assert "tests/test_totals_report.py" not in out
+    assert "8 passed, 15 deselected" in out
 
 
 def test_changing_the_test_file_itself_runs_all_of_it(mixed_repo: Path) -> None:
@@ -150,7 +153,7 @@ def test_an_affected_autouse_conftest_fixture_stops_narrowing(mixed_repo: Path) 
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "would run 13 of 16 tests" in out
+    assert "would run 19 of 19 tests" in out
     assert (
         "all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change" in out
     )
@@ -169,3 +172,47 @@ def test_module_level_code_in_a_conftest_stops_narrowing(mixed_repo: Path) -> No
     assert (
         "all tests: module-level code in tests/conftest.py uses an affected import" in proc.stdout
     )
+
+
+def test_a_file_reached_only_through_a_fixture_is_selected(mixed_repo: Path) -> None:
+    """tests/test_totals_report.py imports nothing a pricing change touches.
+
+    Its one connection to pricing is the taxed_total fixture in
+    tests/conftest.py. The import graph cannot see that file at all, so
+    before file-level fixture selection it was never run.
+    """
+    _change_pricing(mixed_repo)
+    proc = _run(mixed_repo, "--nodes", "--list")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = proc.stdout
+    assert (
+        "tests/test_totals_report.py  [fixture] requests affected fixture taxed_total"
+        " from tests/conftest.py" in out
+    )
+    # And it is still narrowed: only the test that asks for the fixture runs.
+    assert "1 of 3 tests: narrowed by name usage and 1 affected conftest fixture" in out
+    assert "test_the_taxed_total_is_rendered_as_dollars" in out
+    assert "test_zero_renders_as_zero" not in out
+
+
+def test_an_autouse_fixture_selects_a_file_that_imports_nothing_affected(
+    mixed_repo: Path,
+) -> None:
+    """tests/test_shipping_rules.py imports only shipping, never receipts.
+
+    The autouse fixture in tests/conftest.py calls reset_currency() from
+    receipts for every test in the directory, so a receipts change does reach
+    it. Selecting by import alone missed the whole file.
+    """
+    receipts = mixed_repo / "store" / "receipts.py"
+    receipts.write_text(
+        receipts.read_text() + '\n\ndef render_footer(note: str) -> str:\n    return f"-- {note}"\n'
+    )
+    proc = _run(mixed_repo, "--list")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = proc.stdout
+    assert (
+        "tests/test_shipping_rules.py  [fixture] autouse fixture _fresh_currency"
+        " in tests/conftest.py reaches the change" in out
+    )
+    assert "would run 19 of 19 tests" in out

@@ -21,19 +21,16 @@ what it stops short of.
 
 Test-node granularity shipped: `--nodes` and the `--testsniper` plugin
 select individual test functions. The cross-file fixture graph shipped after
-it: an affected `conftest.py` no longer switches narrowing off for its whole
-subtree, because the fixtures the change actually reaches are resolved by
-name across the conftest chain. The items below are what neither does yet.
+it, and then file-level selection through that graph: a test file that imports
+nothing affected and reaches the change only through a conftest fixture is now
+selected, and a conftest that reaches the change for every test underneath
+selects its subtree. The items below are what none of that does yet.
 
-- Select a test file that reaches the change ONLY through a conftest fixture.
-  File-level selection is by import, so a file importing nothing affected is
-  never selected and narrowing never sees it. The fixture graph now knows which
-  fixtures are affected, so the missing piece is deciding what selecting a
-  conftest's subtree should cost when node narrowing is off: without `--nodes`
-  it means running the subtree, and a root conftest that imports application
-  code would pull in the whole suite on every change. Probably wants the
-  subtree added only when a fixture is genuinely affected, and a confidence
-  note when it happens.
+- Read a CHANGED conftest.py the way an affected one is read. Today a changed
+  conftest selects its whole subtree and switches narrowing off for it, because
+  the graph can only read its fixtures at their new content and cannot tell
+  which of them the diff actually touched. Reading the old content out of git
+  and diffing the fixture graphs would narrow it to the fixtures that moved.
 - Fixture awareness for plugin-provided fixtures, which no amount of AST
   reading can attribute to a test. `pytest_plugins` is a refusal today; an
   installed plugin's fixtures are invisible.

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, Protocol
 
 from testsniper.config import Config
+from testsniper.fixtures import FixtureVerdict, analyze_conftests, conftests_for, file_requests
 from testsniper.graph import build_reverse_graph, importers_of, reverse_closure
 from testsniper.indexer import count_tests_in_file, index_tests, is_test_file, path_is_under
 from testsniper.scanner import ModuleInfo, module_name, scan_repo
@@ -20,6 +21,20 @@ PYTEST_CONFIG_FILES: frozenset[str] = frozenset(
 _LEVELS = {"High": 0, "Medium": 1, "Low": 2}
 
 
+class AddTest(Protocol):
+    """The one way a run records a selected test file."""
+
+    def __call__(
+        self,
+        relpath: str,
+        distance: int | None,
+        reason: str,
+        *,
+        whole: str | None = None,
+        via_fixture: bool = False,
+    ) -> None: ...
+
+
 @dataclass
 class SelectedTest:
     """One selected test file with why it was picked."""
@@ -27,9 +42,32 @@ class SelectedTest:
     relpath: str
     distance: int | None
     reason: str
+    # Why node narrowing may not remove tests from this file, when it may not.
+    # Set when a reason to select it is not something per-test name usage can
+    # refine: an always_run path, a changed conftest.py (whose fixtures the
+    # graph can only read at their new content), or a conftest that reaches
+    # the change for every test underneath. Kept separately from ``reason``
+    # because a file can be selected for one reason and run whole for another.
+    whole_file: str | None = None
+    # Selected through a conftest fixture rather than an import. Distance is
+    # None for these, the same as always_run, but they are not the same thing
+    # and the output must not call them one.
+    via_fixture: bool = False
+
+    @property
+    def narrowable(self) -> bool:
+        """Whether node narrowing may drop any of this file's tests."""
+        return self.whole_file is None
 
     def sort_key(self) -> tuple[int, int, str]:
         return (self.distance is None, self.distance or 0, self.relpath)
+
+    @property
+    def channel(self) -> str:
+        """How the change reaches this file, for one word of output."""
+        if self.distance is not None:
+            return f"distance {self.distance}"
+        return "fixture" if self.via_fixture else "always"
 
 
 @dataclass
@@ -56,6 +94,10 @@ class Selection:
     # Every test file that was considered, selected or not. A test in a file
     # that never entered the index was never judged, so it must not be dropped.
     indexed: list[str] = field(default_factory=list)
+    # Conftest chain -> what the change reaches through it. Filled while
+    # selecting, and reused by node narrowing so the two cannot disagree
+    # about which fixtures are affected.
+    fixture_verdicts: dict[tuple[str, ...], FixtureVerdict] = field(default_factory=dict)
 
     def degrade(self, level: str, reason: str) -> None:
         if _LEVELS[level] > _LEVELS[self.confidence]:
@@ -105,10 +147,23 @@ def select(
     reverse = build_reverse_graph(infos)
     picked: dict[str, SelectedTest] = {}
 
-    def add(relpath: str, distance: int | None, reason: str) -> None:
+    def add(
+        relpath: str,
+        distance: int | None,
+        reason: str,
+        *,
+        whole: str | None = None,
+        via_fixture: bool = False,
+    ) -> None:
         existing = picked.get(relpath)
         if existing is None or _better(distance, existing.distance):
-            picked[relpath] = SelectedTest(relpath, distance, reason)
+            picked[relpath] = SelectedTest(relpath, distance, reason, via_fixture=via_fixture)
+            if existing is not None:
+                picked[relpath].whole_file = existing.whole_file
+        # One reason to run a file whole outranks any number of reasons to
+        # narrow it, whichever of them won the right to explain the choice.
+        if whole is not None and picked[relpath].whole_file is None:
+            picked[relpath].whole_file = whole
 
     seeds: dict[str, int] = {}
     deleted: list[str] = []
@@ -162,27 +217,142 @@ def select(
         else:
             for conftest in conftests:
                 subtree = str(PurePosixPath(conftest).parent)
+                reason = f"under changed {conftest}"
                 for rel in test_rels:
                     if path_is_under(rel, subtree):
-                        add(rel, None, f"under changed {conftest}")
+                        add(rel, None, reason, whole=reason)
                 sel.notes.append(f"{conftest} changed; selecting its whole subtree")
 
+    fixture_reached = _select_through_fixtures(root, sel, infos, test_rels, mode, picked, add)
+
     for path in config.always_run:
+        reason = f"always_run ({path})"
         for rel in test_rels:
             if path_is_under(rel, path):
-                add(rel, None, f"always_run ({path})")
+                add(rel, None, reason, whole=reason)
 
     for rel in changed_modules:
         if rel in test_set or rel in deleted:
             continue
         reach = reverse_closure(reverse, {rel: 0}) if rel in infos else {}
-        if not any(r in test_set for r in reach):
-            sel.unreached.append(rel)
+        if any(r in test_set or r in fixture_reached for r in reach):
+            continue
+        sel.unreached.append(rel)
 
     sel.tests = sorted(picked.values(), key=SelectedTest.sort_key)
     sel.selected_tests = sum(counts.get(t.relpath, 0) for t in sel.tests)
     _score_confidence(sel, infos, mode, config_changes, other_changes)
     return sel
+
+
+def _select_through_fixtures(
+    root: Path,
+    sel: Selection,
+    infos: dict[str, ModuleInfo],
+    test_rels: list[str],
+    mode: Mode,
+    picked: dict[str, SelectedTest],
+    add: AddTest,
+) -> set[str]:
+    """Select test files that reach the change only through a conftest fixture.
+
+    The import graph cannot see these. A test file that imports nothing
+    affected is not in the closure at all, so node narrowing never sees it
+    either: narrowing only ever removes tests from a file already selected.
+    What connects it to the change is a fixture name, resolved in a
+    ``conftest.py`` the file never mentions.
+
+    So the conftest chain decides. When the change reaches a fixture, the
+    files that ask for that fixture are selected, and nothing else is. When it
+    reaches something that runs for every test underneath regardless of what
+    any test asks for (an autouse fixture, a hook, module-level code, or
+    anything unreadable), the whole subtree is selected, because that is what
+    the change actually reaches. ``--safe`` skips the per-file question and
+    takes the subtree whenever any fixture is affected.
+
+    Returns the affected conftests that carried the change to at least one
+    test file, so a changed module reached only that way is not reported as
+    reaching no test.
+    """
+    known = {rel for rel in infos if PurePosixPath(rel).name == "conftest.py"}
+    affected_conftests = sorted(c for c in known if c in sel.affected_files)
+    if not affected_conftests:
+        return set()
+    if mode == "aggressive":
+        sel.degrade(
+            "Low",
+            f"affected conftest.py fixtures ignored in aggressive mode"
+            f" ({', '.join(affected_conftests[:3])}); tests can reach the change through them",
+        )
+        return set()
+
+    reached: set[str] = set()
+    notes: dict[tuple[str, ...], str] = {}
+    for rel in test_rels:
+        chain = tuple(c for c in conftests_for(rel) if c in known)
+        hit = [c for c in chain if c in sel.affected_files]
+        if not hit:
+            continue
+        if chain not in sel.fixture_verdicts:
+            sel.fixture_verdicts[chain] = analyze_conftests(
+                root, list(chain), sel.affected_modules, infos
+            )
+        verdict = sel.fixture_verdicts[chain]
+        nearest = hit[-1]
+        was_picked = rel in picked
+
+        if verdict.block is not None:
+            add(rel, None, verdict.block, whole=verdict.block, via_fixture=True)
+            reached.update(hit)
+            if not was_picked:
+                notes[chain] = f"{verdict.block}, so every test it applies to is selected"
+            continue
+        if not verdict.tainted:
+            continue
+
+        names = ", ".join(sorted(verdict.tainted))
+        if mode == "safe":
+            add(
+                rel,
+                None,
+                f"under affected {nearest}, whose fixtures reach the change",
+                via_fixture=True,
+            )
+            reached.update(hit)
+            if not was_picked:
+                notes[chain] = (
+                    f"{nearest} is affected through {names}; safe mode selects its whole subtree"
+                )
+            continue
+
+        module = infos[rel].module if rel in infos else rel
+        request = file_requests(root, rel, module, verdict.tainted)
+        if not request.requested:
+            continue
+        reached.update(hit)
+        if request.unreadable:
+            add(
+                rel,
+                None,
+                f"{request.unreadable}, so it may request an affected fixture",
+                via_fixture=True,
+            )
+        else:
+            asked = ", ".join(sorted(request.requested))
+            add(
+                rel,
+                None,
+                f"requests affected fixture {asked} from {nearest}",
+                via_fixture=True,
+            )
+        if not was_picked:
+            notes[chain] = (
+                f"{nearest} is affected through {names};"
+                " selecting the tests that request those fixtures"
+            )
+
+    sel.notes.extend(notes[chain] for chain in sorted(notes))
+    return reached
 
 
 def _better(new: int | None, old: int | None) -> bool:

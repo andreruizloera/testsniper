@@ -38,16 +38,18 @@ $ pytest --testsniper
 ============================= test session starts ==============================
 testsniper: default mode, working tree vs HEAD
 plugins: testsniper-0.1.0
-collected 20 items / 12 deselected / 8 selected
+collected 23 items / 14 deselected / 9 selected
 
-tests/test_checkout.py ........                                          [100%]
+tests/test_checkout.py ........                                          [ 88%]
+tests/test_totals_report.py .                                            [100%]
 
 ---------------------------------- testsniper ----------------------------------
 1 changed file(s), working tree vs HEAD
-selected 8 of 20 collected tests
+selected 9 of 23 collected tests
   tests/test_checkout.py: 8 of 14, narrowed by name usage and 1 affected conftest fixture
+  tests/test_totals_report.py: 1 of 3, narrowed by name usage and 1 affected conftest fixture
 selection confidence: High
-======================= 8 passed, 12 deselected in 0.67s =======================
+======================= 9 passed, 14 deselected in 0.17s =======================
 ```
 
 Both blocks are real `demo.sh` output. The second is trimmed of the platform,
@@ -56,16 +58,17 @@ run to run; nothing else is edited.
 
 ### Fixtures the test file never imports
 
-That last line says "1 affected conftest fixture" because the change reaches
-one of the fixtures in `tests/conftest.py`, and one test asks for it. Fixtures
-are the usual way a change reaches a test without the test file importing
-anything, so narrowing resolves them across files the way pytest does:
+Fixtures are the usual way a change reaches a test without the test file
+importing anything, so testsniper resolves them across files the way pytest
+does, in both directions: which tests inside a selected file the change
+reaches, and which files it reaches that no import path connects to at all.
 
 ```text
 $ testsniper --nodes --list
 Changed: store/pricing.py
-Selected: tests/test_checkout.py
-Selected (would run 7 of 16 tests):
+Note: tests/conftest.py is affected through taxed_total; selecting the tests that request those fixtures
+Selected: tests/test_checkout.py, tests/test_totals_report.py
+Selected (would run 8 of 19 tests):
   tests/test_checkout.py  [distance 1] imports a changed module
     7 of 13 tests: narrowed by name usage and 1 affected conftest fixture
       test_line_total_multiplies
@@ -75,26 +78,48 @@ Selected (would run 7 of 16 tests):
       test_price_with_tax_rounds_half_up
       test_receipt_shows_the_taxed_total
       test_subtotal_sums_every_line
+  tests/test_totals_report.py  [fixture] requests affected fixture taxed_total from tests/conftest.py
+    1 of 3 tests: narrowed by name usage and 1 affected conftest fixture
+      test_the_taxed_total_is_rendered_as_dollars
 Selection confidence: High
 ```
 
-`test_receipt_shows_the_taxed_total` is in that list only because it requests
-the `taxed_total` fixture, which is defined in `tests/conftest.py` and reaches
-pricing through `store.orders`. The `basket` fixture next to it does not reach
-pricing, so the tests that ask only for that one are still dropped.
+Two things there come from the fixture graph rather than the import graph.
+`test_receipt_shows_the_taxed_total` is kept inside a file it shares with
+dropped tests, because it requests the `taxed_total` fixture, which is defined
+in `tests/conftest.py` and reaches pricing through `store.orders`. And
+`tests/test_totals_report.py` is selected at all only for that reason: it
+imports one formatting helper, no import path connects it to pricing, and it
+asks for the same fixture. `[fixture]` rather than `[distance N]` is how the
+output says so. The `basket` fixture next to `taxed_total` does not reach
+pricing, so the tests that ask only for that one are still dropped, in both
+files.
 
 When the change reaches something in a conftest that applies to every test
-underneath it, narrowing gives up for that directory and names what stopped it:
+underneath it, that is not one fixture any more, and the whole directory is
+selected with the reason:
 
 ```text
 $ testsniper --nodes --list   # after changing store/receipts.py instead
 Changed: store/receipts.py
-Selected: tests/test_checkout.py
-Selected (would run 13 of 16 tests):
+Note: autouse fixture _fresh_currency in tests/conftest.py reaches the change, so every test it applies to is selected
+Selected: tests/test_checkout.py, tests/test_totals_report.py, tests/test_shipping_rules.py
+Selected (would run 19 of 19 tests):
   tests/test_checkout.py  [distance 1] imports a changed module
+    all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change
+  tests/test_totals_report.py  [distance 1] imports a changed module
+    all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change
+  tests/test_shipping_rules.py  [fixture] autouse fixture _fresh_currency in tests/conftest.py reaches the change
     all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change
 Selection confidence: High
 ```
+
+`tests/test_shipping_rules.py` imports only `store.shipping` and never
+mentions receipts or that fixture. It runs because `_fresh_currency` is
+autouse: it calls `reset_currency()` from the changed module before every test
+in the directory, asked for or not. Selecting the subtree is the honest answer
+there, and it is the cost of this channel; "How selection follows fixtures"
+below lists exactly when it is paid.
 
 ## Quickstart
 
@@ -105,14 +130,15 @@ uv sync
 uv run bash demo.sh
 ```
 
-The demo runs in three parts. Part 1 copies the generated example project (40
+The demo runs in four parts. Part 1 copies the generated example project (40
 modules, 402 tests) to a temp directory, edits one module, and shows the
 default, `--aggressive`, and `--safe --list` selections. Part 2 copies the
 mixed example project, edits `store/pricing.py`, and shows the same change
-narrowed to individual tests by `--nodes` and by the plugin. Part 3 changes a
-different module in that project, one an autouse fixture reaches, and shows
-narrowing refuse with the reason. The script checks the lines this README
-pastes and exits nonzero if any of them has drifted.
+narrowed to individual tests by `--nodes` and by the plugin. Part 3 shows the
+file that same change reaches only through a conftest fixture. Part 4 changes a
+different module in that project, one an autouse fixture reaches, and shows the
+whole directory selected with the reason. The script checks the lines this
+README pastes and exits nonzero if any of them has drifted.
 
 ## Why?
 
@@ -232,18 +258,46 @@ shadowing an affected conftest fixture keeps that name marked affected: working
 out whether the override is clean is possible, over-selecting is safe, and this
 takes the safe one.
 
+### How selection follows fixtures
+
+The same fixture names decide which FILES are selected, which is a separate
+question and the one an import graph cannot answer. When a `conftest.py` that
+applies to a test file is in the change's closure:
+
+- if the change reaches it only through ordinary fixtures, the files that ask
+  for one of those fixtures are selected and the rest are not. Asking means
+  reading the name anywhere in the file: a test parameter, another fixture's
+  parameter, or a `pytest.mark.usefixtures("name")` mark.
+- if the change reaches something that runs for every test underneath
+  regardless of what any test asks for (an autouse fixture, a `pytest_*` hook,
+  module-level code, `pytest_plugins`), the whole subtree is selected. Nothing
+  finer would be true.
+- if a file cannot be read well enough to tell (it does not parse, or it calls
+  `request.getfixturevalue()`), it is selected. Unknown is not "no".
+- `--safe` skips the per-file question and takes the whole subtree whenever any
+  fixture is affected. `--aggressive` ignores this channel entirely and drops
+  confidence to Low, saying which conftest it ignored.
+
+A file selected this way prints `[fixture]` where an imported one prints
+`[distance N]`, and node narrowing still applies to it: being selected through
+a fixture does not mean every test in the file runs.
+
 ### Modes
 
-| Mode | Selection | Changed conftest.py | Changed config or non-Python file |
-| --- | --- | --- | --- |
-| `--safe` | transitive closure, widened to every module in each changed module's package | selects its whole subtree | selects everything, with the reason printed |
-| default | full transitive closure over the reverse import graph | selects its whole subtree | ignored, confidence drops to Low with a pointer to `--safe` |
-| `--aggressive` | only tests that import a changed module directly | ignored, confidence drops to Low | ignored, confidence drops to Low |
+| Mode | Selection | Changed conftest.py | Affected conftest.py | Changed config or non-Python file |
+| --- | --- | --- | --- | --- |
+| `--safe` | transitive closure, widened to every module in each changed module's package | selects its whole subtree | selects its whole subtree | selects everything, with the reason printed |
+| default | full transitive closure over the reverse import graph | selects its whole subtree | selects the files that request an affected fixture, or the subtree when the change is not fixture-shaped | ignored, confidence drops to Low with a pointer to `--safe` |
+| `--aggressive` | only tests that import a changed module directly | ignored, confidence drops to Low | ignored, confidence drops to Low | ignored, confidence drops to Low |
+
+A CHANGED conftest is one in your diff. An AFFECTED one is one that imports
+something in your diff, directly or transitively, which is the case its
+fixtures have to be read for.
 
 All modes always include `always_run` paths and rank selected tests by
-import distance, direct importers first. Node narrowing is orthogonal: the
-mode decides which files are selected, and `--nodes` then narrows inside each
-of them.
+import distance, direct importers first, then the files reached only through a
+fixture. Node narrowing is orthogonal: the mode decides which files are
+selected, and `--nodes` then narrows inside each of them.
 
 ### Configuration
 
@@ -277,8 +331,9 @@ Warning: no test reaches changed module pkg/lonely.py
 
 To be plain about it: skipped tests are skipped because no static import
 path connects them to your change, not because they provably cannot fail.
-Runtime dispatch, fixtures with side effects, data files, and
-monkeypatching can all cross module boundaries invisibly. Node narrowing
+Runtime dispatch, data files, and monkeypatching can all cross module
+boundaries invisibly; conftest fixtures are followed, but only the ones written
+in Python that testsniper can read. Node narrowing
 adds a second such layer, since it reads names rather than executing them.
 That is what the confidence rating, the refusal rules above, and `--safe`
 are for, and why CI should still run the full suite.
@@ -292,18 +347,21 @@ src/testsniper/
   scanner.py   AST scan of every .py file: imports, star/dynamic flags
   graph.py     reverse import graph and BFS transitive closure
   indexer.py   test file discovery and test function counting
-  selector.py  modes, conftest/config triggers, always_run, confidence
+  selector.py  modes, conftest/config triggers, always_run, confidence,
+               and the files reached only through a fixture
   usage.py     name-usage primitives: what a piece of syntax reads
   nodes.py     per-test name-usage analysis inside a selected file
-  fixtures.py  which conftest fixtures a change reaches, across the chain
+  fixtures.py  which conftest fixtures a change reaches across the chain,
+               and which test files ask for them
   plan.py      the JSON contract carrying a selection into pytest
   plugin.py    pytest plugin: deselect at collection time
   runner.py    pytest invocation on the selected files
 ```
 
 The pipeline: diff -> changed modules -> reverse import graph (who imports
-whom, transitively) -> test files in the closure, ranked by distance ->
-optionally, the test functions inside them that read an affected import ->
+whom, transitively) -> test files in the closure, ranked by distance, plus the
+files that request a fixture the change reaches -> optionally, the test
+functions inside them that read an affected import or ask for such a fixture ->
 pytest. Graph nodes are file paths, not module names, so name collisions
 (every `conftest.py`) can only over-select, never under-select.
 
@@ -311,8 +369,11 @@ pytest. Graph nodes are file paths, not module names, so name collisions
 of affected module names, and return a verdict. Neither knows anything about
 git, pytest, or the graph that produced the affected set, and both read files
 through the same primitives in `usage.py`, so the in-file and cross-file
-analyses cannot drift apart on what a name means. `plugin.py` is the only
-module that imports pytest, and nothing imports `plugin.py`.
+analyses cannot drift apart on what a name means. The conftest chain is read
+once per chain during selection and the verdict is carried on the `Selection`,
+so the file-level and node-level answers come from one reading rather than two.
+`plugin.py` is the only module that imports pytest, and nothing imports
+`plugin.py`.
 
 Two example projects are committed. `examples/fixture_project/` is generated
 deterministically by `scripts/gen_fixture.py`: 10 independent import chains of
@@ -321,9 +382,12 @@ deterministically by `scripts/gen_fixture.py`: 10 independent import chains of
 its files uses the same module, so node narrowing has nothing to remove there.
 `examples/mixed_project/` exists for that: one small store whose checkout test
 file mixes pricing, shipping, and formatting tests, so a pricing change reaches
-7 of its 13 test functions and none of the other file. Its `tests/conftest.py`
+7 of its 13 test functions and none of the shipping file. Its `tests/conftest.py`
 is mixed the same way, with one fixture a pricing change reaches, one it does
-not, and one autouse fixture that a receipts change does reach.
+not, and one autouse fixture that a receipts change does reach. A third test
+file, `tests/test_totals_report.py`, imports nothing a pricing change touches
+and is reachable only through that conftest fixture, which is what the import
+graph on its own cannot see.
 
 ## Limitations
 
@@ -342,13 +406,19 @@ not, and one autouse fixture that a receipts change does reach.
   reached through `pytest_plugins`, is not attributable to a test by any amount
   of AST reading; `pytest_plugins` is a refusal, and an installed plugin's
   fixtures are simply invisible.
-- **File-level selection does not follow fixtures at all.** A test file is
-  selected because it imports something in the change's closure. A file that
-  imports nothing affected and reaches the change only through a conftest
-  fixture is not selected, and node narrowing never sees it, because narrowing
-  only ever removes tests from an already-selected file. Suites where the
-  fixtures do all the work and the test files import almost nothing are the
-  case to watch; run the full suite in CI, which you should be doing anyway.
+- **A conftest that reaches the change for every test underneath selects its
+  whole subtree.** That is an autouse fixture, a `pytest_*` hook, module-level
+  code, or `pytest_plugins`, and it is the correct answer rather than a
+  heuristic: those run whether a test asks for them or not. The cost is that a
+  root `conftest.py` with an autouse fixture that touches application code will
+  select the entire suite on most changes. Selection says which conftest did it
+  and why, so you can see it happening; moving that fixture down the tree, or
+  narrowing what it imports, is the fix.
+- Selecting a file through a fixture asks whether the name is read anywhere in
+  it, not which test reads it. That is deliberate, since the per-test question
+  is what `--nodes` answers, but it means a local variable that happens to
+  share a conftest fixture's name will select the file. Over-selection, and it
+  costs a file rather than a suite.
 - A file whose imports reach the change but whose tests never use them is
   dropped entirely. That is the intended behavior and it is the case most
   likely to surprise; `--list` names every selected function so you can check.
@@ -360,9 +430,9 @@ not, and one autouse fixture that a receipts change does reach.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Highlights: PyPI release, selecting a test file
-that reaches the change only through a conftest fixture, import graph caching,
-and coverage-map hybrid selection.
+See [ROADMAP.md](ROADMAP.md). Highlights: PyPI release, narrowing on the
+changed symbol rather than the changed module, import graph caching, and
+coverage-map hybrid selection.
 
 ## Contributing
 
