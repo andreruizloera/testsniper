@@ -152,6 +152,51 @@ Selected (would run 0 of 19 tests):
 Selection confidence: High
 ```
 
+### When the test file is the change
+
+A changed test file used to be the last place a diff was read as a whole
+file: it ran in full, even though the diff already said which of its functions
+moved. It is now read exactly the way a changed `conftest.py` is, against its
+own previous content:
+
+```text
+$ testsniper --nodes --list   # after adding one test to test_checkout.py
+Changed: tests/test_checkout.py
+Selected: tests/test_checkout.py
+Selected (would run 1 of 20 tests):
+  tests/test_checkout.py  [distance 0] changed test file
+    1 of 14 tests: narrowed by its own diff and name usage
+      test_shipping_is_free_over_ten_kilos
+Selection confidence: High
+```
+
+One of fourteen, where the whole file used to run. Taint spreads from the diff
+the way it spreads from an import, so this is not only about tests that moved
+themselves. Editing the `_render` helper that `TestReceiptFormatting` shares
+selects the two methods that call it, and not the third, which does not:
+
+```text
+$ testsniper --nodes --list   # after editing one helper method
+Changed: tests/test_checkout.py
+Selected: tests/test_checkout.py
+Selected (would run 2 of 19 tests):
+  tests/test_checkout.py  [distance 0] changed test file
+    2 of 13 tests: narrowed by its own diff and name usage
+      TestReceiptFormatting::test_amounts_are_dollars_and_cents
+      TestReceiptFormatting::test_header_names_the_customer
+Selection confidence: High
+```
+
+A class is compared in two parts, because its body is not like its methods.
+Bases, decorators, and class-body statements are shared by every test on the
+class, so a move in any of them selects all of them; the methods are then
+compared one at a time. The whole file still runs, with the reason, when the
+diff cannot be localized: module-level code moved or reads something that did,
+an autouse fixture or a `pytest_generate_tests` hook changed or was deleted, a
+star import changed, or there is no readable previous content, which is the
+case for a brand new test file. `--safe` runs a changed test file whole
+whenever it changed at all.
+
 ## Quickstart
 
 ```bash
@@ -161,7 +206,7 @@ uv sync
 uv run bash demo.sh
 ```
 
-The demo runs in five parts. Part 1 copies the generated example project (40
+The demo runs in six parts. Part 1 copies the generated example project (40
 modules, 402 tests) to a temp directory, edits one module, and shows the
 default, `--aggressive`, and `--safe --list` selections. Part 2 copies the
 mixed example project, edits `store/pricing.py`, and shows the same change
@@ -170,7 +215,9 @@ file that same change reaches only through a conftest fixture. Part 4 changes a
 different module in that project, one an autouse fixture reaches, and shows the
 whole directory selected with the reason. Part 5 edits the `conftest.py`
 itself, once in a fixture body and once in a comment, and shows the first
-selecting two tests and the second selecting none. The script checks the lines
+selecting two tests and the second selecting none. Part 6 edits a test file
+itself, once by adding a test and once by editing a helper method inside a
+class, and shows one test selected and then two. The script checks the lines
 this README pastes and exits nonzero if any of them has drifted.
 
 ## Why?
@@ -264,9 +311,9 @@ overrode. Those names are then treated exactly like an affected import.
 
 The analysis refuses to narrow a file, and runs all of it, when:
 
-- the test file itself changed, or it is in an `always_run` path, or it sits
-  under a changed `conftest.py` whose diff could not be localized to
-  individual fixtures (see below)
+- it is in an `always_run` path, or it sits under a changed `conftest.py`
+  whose diff could not be localized to individual fixtures (see below), or it
+  is itself a changed test file whose own diff could not be localized either
 - an autouse fixture reaches the change, in the file or in an applicable
   conftest, since an autouse fixture runs for tests that never name it
 - a `pytest_*` hook in an applicable conftest reaches the change, since hooks
@@ -362,6 +409,10 @@ A CHANGED conftest is one in your diff. An AFFECTED one is one that imports
 something in your diff, directly or transitively, which is the case its
 fixtures have to be read for.
 
+A changed TEST file is always selected, in every mode, so it does not appear
+in that table. What the mode decides is whether its diff may narrow inside it:
+`--safe` runs all of it, and the other two read the diff.
+
 All modes always include `always_run` paths and rank selected tests by
 import distance, direct importers first, then the files reached only through a
 fixture. Node narrowing is orthogonal: the mode decides which files are
@@ -419,7 +470,8 @@ src/testsniper/
   selector.py  modes, conftest/config triggers, always_run, confidence,
                and the files reached only through a fixture
   usage.py     name-usage primitives: what a piece of syntax reads
-  nodes.py     per-test name-usage analysis inside a selected file
+  nodes.py     per-test name-usage analysis inside a selected file,
+               including a test file that changed itself
   fixtures.py  which conftest fixtures a change reaches across the chain,
                including a conftest that changed itself, and which test
                files ask for them
@@ -491,11 +543,14 @@ graph on its own cannot see.
   is what `--nodes` answers, but it means a local variable that happens to
   share a conftest fixture's name will select the file. Over-selection, and it
   costs a file rather than a suite.
-- A changed `conftest.py` is diffed against one revision: the one the run
-  compares against (`HEAD`, or the revision you name). Two edits in a row
-  without a commit are one diff, which is correct, but it also means a
-  conftest changed in an earlier, already-committed commit is not in the
-  change set at all unless you point testsniper at a revision before it.
+- A changed `conftest.py` or test file is diffed against one revision: the
+  one the run compares against (`HEAD`, or the revision you name). Two edits in
+  a row without a commit are one diff, which is correct, but it also means a
+  file changed in an earlier, already-committed commit is not in the change set
+  at all unless you point testsniper at a revision before it.
+- A changed test file is diffed by parsed syntax, so moving a test within its
+  file selects nothing, and renaming one selects the new name only. Neither is
+  wrong, but neither is what a reader of the text diff would predict.
 - A file whose imports reach the change but whose tests never use them is
   dropped entirely. That is the intended behavior and it is the case most
   likely to surprise; `--list` names every selected function so you can check.

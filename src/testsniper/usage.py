@@ -30,6 +30,10 @@ _OPAQUE_BUILTINS: frozenset[str] = frozenset({"globals", "locals", "eval", "exec
 # parameter name. The AST can see the call and not the connection.
 _OPAQUE_CALLS: frozenset[str] = frozenset({"getfixturevalue"})
 
+# Statements that define a name, compared one by one rather than as part of
+# the module-level code that runs on import.
+DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
 
 def is_affected(dotted: str, affected: set[str], *, with_prefixes: bool = False) -> bool:
     """Whether importing ``dotted`` can reach an affected module.
@@ -210,6 +214,45 @@ def declares_pytest_plugins(tree: ast.Module) -> bool:
         ):
             return True
     return False
+
+
+def module_statements(tree: ast.Module) -> list[str]:
+    """Module-level statements that run on import, as parsed syntax.
+
+    Definitions and imports are left out because they are compared one at a
+    time and more precisely. Docstrings are NOT exempt, here or in a
+    definition: under ``--doctest-modules`` pytest collects doctests out of a
+    module, so a docstring can be a test and editing it can change a result.
+    """
+    return [
+        ast.dump(stmt)
+        for stmt in tree.body
+        if not isinstance(stmt, (*DEF_TYPES, ast.Import, ast.ImportFrom))
+    ]
+
+
+def bound_names(stmt: ast.Import | ast.ImportFrom) -> set[str]:
+    """The module-level names an import statement binds."""
+    return {alias.asname or alias.name.split(".")[0] for alias in stmt.names}
+
+
+def changed_imports(old: ast.Module, new: ast.Module) -> tuple[set[str], bool]:
+    """Names bound by a module-level import statement the diff touched.
+
+    The second value says a star import moved, which makes the names it binds
+    unknowable, so callers refuse rather than narrow.
+    """
+    old_imports = [s for s in old.body if isinstance(s, ast.Import | ast.ImportFrom)]
+    new_imports = [s for s in new.body if isinstance(s, ast.Import | ast.ImportFrom)]
+    shared = {ast.dump(s) for s in old_imports} & {ast.dump(s) for s in new_imports}
+    names: set[str] = set()
+    for stmt in (*old_imports, *new_imports):
+        if ast.dump(stmt) in shared:
+            continue
+        if any(alias.name == "*" for alias in stmt.names):
+            return names, True
+        names |= bound_names(stmt)
+    return names, False
 
 
 def reaches(start: set[str], defs: dict[str, set[str]], affected_names: set[str]) -> bool:

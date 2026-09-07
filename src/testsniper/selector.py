@@ -104,6 +104,11 @@ class Selection:
     # selecting, and reused by node narrowing so the two cannot disagree
     # about which fixtures are affected.
     fixture_verdicts: dict[tuple[str, ...], FixtureVerdict] = field(default_factory=dict)
+    # Changed test file -> its content at the revision compared against, or
+    # None when that revision does not have it. Presence in this map is what
+    # says a changed test file may be narrowed by its own diff; absence keeps
+    # the older answer, which is to run all of it.
+    changed_test_sources: dict[str, str | None] = field(default_factory=dict)
 
     def degrade(self, level: str, reason: str) -> None:
         if _LEVELS[level] > _LEVELS[self.confidence]:
@@ -236,6 +241,15 @@ def select(
                     if path_is_under(rel, subtree):
                         add(rel, None, reason, whole=reason)
                 sel.notes.append(f"{conftest} changed; selecting its whole subtree")
+    # A changed TEST file is read through its own diff the same way, which is
+    # a node-level answer: the file is selected either way, and the diff says
+    # which of its tests moved. --safe keeps the older answer and runs all of
+    # it, exactly as it takes a changed conftest's whole subtree.
+    if mode != "safe" and old_source is not None:
+        for rel in changed_modules:
+            if rel in test_set and rel in infos:
+                sel.changed_test_sources[rel] = old_source(rel)
+
     if conftests and mode == "aggressive":
         sel.degrade(
             "Low",

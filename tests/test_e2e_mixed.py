@@ -119,10 +119,26 @@ def test_changing_shipping_selects_a_different_slice(mixed_repo: Path) -> None:
     assert "8 passed, 15 deselected" in out
 
 
-def test_changing_the_test_file_itself_runs_all_of_it(mixed_repo: Path) -> None:
+def test_a_test_added_to_a_test_file_is_the_only_one_selected(mixed_repo: Path) -> None:
+    """A changed test file used to run in full; now its diff says which test.
+
+    Nothing else in the repository changed, so the added test is the entire
+    change and the other thirteen in the file have nothing to do with it.
+    """
     checkout = mixed_repo / "tests" / "test_checkout.py"
     checkout.write_text(checkout.read_text() + "\n\ndef test_added():\n    assert True\n")
     proc = _run(mixed_repo, "--nodes", "--list")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = proc.stdout
+    assert "1 of 14 tests: narrowed by its own diff and name usage" in out
+    assert "      test_added\n" in out
+    assert "test_subtotal_sums_every_line" not in out
+
+
+def test_a_changed_test_file_is_run_whole_in_safe_mode(mixed_repo: Path) -> None:
+    checkout = mixed_repo / "tests" / "test_checkout.py"
+    checkout.write_text(checkout.read_text() + "\n\ndef test_added():\n    assert True\n")
+    proc = _run(mixed_repo, "--nodes", "--list", "--safe")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "all tests: the test file itself changed" in proc.stdout
 

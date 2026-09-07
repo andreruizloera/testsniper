@@ -19,6 +19,9 @@
 # Part 5 changes the conftest.py itself, twice: once in one fixture body, and
 # once in a comment. The old content comes out of git, so the first selects
 # the tests that ask for that fixture and the second selects nothing.
+# Part 6 changes a TEST file itself, and reads it the same way: an added test
+# is the only test selected, and an edited helper method selects the methods
+# that call it.
 set -euo pipefail
 
 if ! command -v testsniper >/dev/null 2>&1; then
@@ -138,6 +141,38 @@ echo "\$ testsniper --list"
 comment_out="$(testsniper --list)"
 echo "$comment_out"
 
+echo
+echo "### Part 6: a changed test file, read through its own diff"
+echo
+echo "The test file is the change. A new test is the only thing the change"
+echo "reaches, and a helper method inside a class reaches the methods that"
+echo "call it and not the sibling that does not."
+echo
+setup mixed_project
+printf '\n\ndef test_shipping_is_free_over_ten_kilos():\n    assert shipping_cost(10000) == 0\n' \
+    >> tests/test_checkout.py
+echo "\$ testsniper --nodes --list"
+added_out="$(testsniper --nodes --list)"
+echo "$added_out"
+echo
+echo "And editing the _render helper the class shares:"
+echo
+git checkout -q -- tests/test_checkout.py
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("tests/test_checkout.py")
+path.write_text(
+    path.read_text().replace(
+        'return render_receipt("Ada", [("Shipping", 599)])',
+        'return render_receipt("Ada", [("Shipping", 600 - 1)])',
+    )
+)
+EOF
+echo "\$ testsniper --nodes --list"
+helper_out="$(testsniper --nodes --list)"
+echo "$helper_out"
+
 # The README pastes these lines. Fail loudly rather than let them drift.
 expect() {
     if ! printf '%s' "$1" | grep -qF -- "$2"; then
@@ -162,5 +197,10 @@ expect "$changed_out" \
 expect "$changed_out" "test_receipt_shows_the_taxed_total"
 expect "$comment_out" "Changed: tests/conftest.py"
 expect "$comment_out" "Selected: none"
+expect "$added_out" "1 of 14 tests: narrowed by its own diff and name usage"
+expect "$added_out" "test_shipping_is_free_over_ten_kilos"
+expect "$helper_out" "2 of 13 tests: narrowed by its own diff and name usage"
+expect "$helper_out" "TestReceiptFormatting::test_amounts_are_dollars_and_cents"
+expect "$helper_out" "TestReceiptFormatting::test_header_names_the_customer"
 echo
 echo "Demo checks passed."

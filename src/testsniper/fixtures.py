@@ -60,18 +60,19 @@ from pathlib import Path, PurePosixPath
 
 from testsniper.scanner import ModuleInfo
 from testsniper.usage import (
+    DEF_TYPES,
     LOCAL_IMPORT,
     FuncDef,
+    changed_imports,
     declares_pytest_plugins,
     fixture_info,
     has_dynamic_import,
     index_module,
     module_bindings,
+    module_statements,
     package_parts,
     reaches,
 )
-
-_DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 # Marker standing for "this definition reads an affected import". Taint is
 # resolved with one graph walk over every conftest in the chain at once, so
@@ -109,26 +110,6 @@ class _ConftestDiff:
     block: str | None = None
 
 
-def _module_statements(tree: ast.Module) -> list[str]:
-    """Module-level statements that run on import, as parsed syntax.
-
-    Definitions and imports are compared separately and more precisely.
-    Docstrings are NOT exempt, here or in a definition: under
-    ``--doctest-modules`` pytest collects doctests out of a ``conftest.py``,
-    so a docstring in one can be a test, and editing it can change a result.
-    """
-    return [
-        ast.dump(stmt)
-        for stmt in tree.body
-        if not isinstance(stmt, (*_DEF_TYPES, ast.Import, ast.ImportFrom))
-    ]
-
-
-def _bound_names(stmt: ast.Import | ast.ImportFrom) -> set[str]:
-    """The module-level names an import statement binds."""
-    return {alias.asname or alias.name.split(".")[0] for alias in stmt.names}
-
-
 def _diff_conftest(relpath: str, old_source: str | None, tree: ast.Module) -> _ConftestDiff:
     """Which of a changed conftest's definitions the diff actually touched.
 
@@ -146,22 +127,15 @@ def _diff_conftest(relpath: str, old_source: str | None, tree: ast.Module) -> _C
     if declares_pytest_plugins(old) or has_dynamic_import(old):
         return _ConftestDiff(block=f"the previous content of {relpath} could not be analyzed")
 
-    if _module_statements(old) != _module_statements(tree):
+    if module_statements(old) != module_statements(tree):
         return _ConftestDiff(block=f"module-level code in {relpath} changed; it runs on import")
 
-    old_imports = [s for s in old.body if isinstance(s, ast.Import | ast.ImportFrom)]
-    new_imports = [s for s in tree.body if isinstance(s, ast.Import | ast.ImportFrom)]
-    shared = {ast.dump(s) for s in old_imports} & {ast.dump(s) for s in new_imports}
-    changed_names: set[str] = set()
-    for stmt in (*old_imports, *new_imports):
-        if ast.dump(stmt) in shared:
-            continue
-        if any(alias.name == "*" for alias in stmt.names):
-            return _ConftestDiff(block=f"a star import in {relpath} changed")
-        changed_names |= _bound_names(stmt)
+    changed_names, star_moved = changed_imports(old, tree)
+    if star_moved:
+        return _ConftestDiff(block=f"a star import in {relpath} changed")
 
-    old_defs = {s.name: s for s in old.body if isinstance(s, _DEF_TYPES)}
-    new_defs = {s.name: s for s in tree.body if isinstance(s, _DEF_TYPES)}
+    old_defs = {s.name: s for s in old.body if isinstance(s, DEF_TYPES)}
+    new_defs = {s.name: s for s in tree.body if isinstance(s, DEF_TYPES)}
     changed_defs = {
         name
         for name, node in new_defs.items()
