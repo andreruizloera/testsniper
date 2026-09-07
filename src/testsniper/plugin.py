@@ -28,7 +28,7 @@ import pytest
 
 from testsniper import plan as plan_mod
 from testsniper.config import load_config
-from testsniper.gitio import GitError, changed_files, repo_root
+from testsniper.gitio import GitError, changed_files, file_at_ref, repo_root
 from testsniper.nodes import Key, narrow_selection
 from testsniper.plan import Plan
 from testsniper.scanner import scan_repo
@@ -106,7 +106,20 @@ def _build_plan(config: pytest.Config) -> Plan:
         raise pytest.UsageError(f"testsniper: {exc}") from exc
 
     infos = scan_repo(root)
-    selection = select(root, changed, mode, load_config(root), infos)
+    # The revision the change is measured against, and therefore where a
+    # changed file's previous content has to come from. Without this the
+    # plugin would answer a changed conftest.py by running its whole subtree,
+    # which is the fallback for a caller that cannot read the old content,
+    # not the answer the command gives.
+    base = ref or "HEAD"
+    selection = select(
+        root,
+        changed,
+        mode,
+        load_config(root),
+        infos,
+        old_source=lambda relpath: file_at_ref(root, relpath, base),
+    )
     nodes = narrow_selection(root, selection, infos)
     if staged:
         source = "staged changes"

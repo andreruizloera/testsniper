@@ -279,3 +279,47 @@ def test_the_entry_point_registers_the_plugin_in_a_subprocess(
     result = pytester.runpytest_subprocess(f"--testsniper-plan={path}")
     result.assert_outcomes(passed=1, deselected=7)
     result.stdout.fnmatch_lines(["*plugins:*testsniper*"])
+
+
+CONFTEST_PROJECT = {
+    "tests/conftest.py": (
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def alpha():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def beta():\n"
+        "    return 2\n"
+    ),
+    "tests/test_alpha.py": "def test_with_alpha(alpha):\n    assert alpha == 1\n",
+    "tests/test_beta.py": "def test_with_beta(beta):\n    assert beta == 2\n",
+}
+
+# Same fixtures, same behavior, but alpha's body is different parsed syntax.
+CONFTEST_ALPHA_EDITED = CONFTEST_PROJECT["tests/conftest.py"].replace(
+    "def alpha():\n    return 1\n", "def alpha():\n    value = 1\n    return value\n"
+)
+
+
+def test_a_changed_conftest_is_read_through_its_diff_by_the_plugin(
+    pytester: pytest.Pytester,
+) -> None:
+    """The plugin analyzes with the same revision the command does.
+
+    Without a way to read the conftest's previous content the analysis falls
+    back to running its whole subtree, which is the answer for a caller that
+    has no revision, not the answer for one running inside a git repository.
+    """
+    for rel, content in CONFTEST_PROJECT.items():
+        path = pytester.path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git_init(pytester.path)
+    (pytester.path / "tests" / "conftest.py").write_text(CONFTEST_ALPHA_EDITED, encoding="utf-8")
+    result = pytester.runpytest("--testsniper")
+    result.assert_outcomes(passed=1, deselected=1)
+    result.stdout.fnmatch_lines(["*selected 1 of 2 collected tests*"])
