@@ -323,3 +323,24 @@ def test_a_changed_conftest_is_read_through_its_diff_by_the_plugin(
     result = pytester.runpytest("--testsniper")
     result.assert_outcomes(passed=1, deselected=1)
     result.stdout.fnmatch_lines(["*selected 1 of 2 collected tests*"])
+
+
+def test_a_changed_test_file_is_read_through_its_diff_by_the_plugin(
+    pytester: pytest.Pytester,
+) -> None:
+    """The plugin is how most runs reach this, so it gets its own check.
+
+    The CLI path is covered end to end in test_e2e_mixed.py; this is the same
+    selection arriving through pytest, where the deselection is real.
+    """
+    _make_project(pytester)
+    _git_init(pytester.path)
+    mixed = pytester.path / "tests" / "test_mixed.py"
+    mixed.write_text(
+        mixed.read_text() + "\n\ndef test_added_later():\n    assert True\n",
+        encoding="utf-8",
+    )
+    result = pytester.runpytest("--testsniper")
+    # Only the added test, not the seven other cases in the file it was added to.
+    result.assert_outcomes(passed=1, deselected=8)
+    result.stdout.fnmatch_lines(["*narrowed by its own diff and name usage*"])
