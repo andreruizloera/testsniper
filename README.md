@@ -121,6 +121,37 @@ in the directory, asked for or not. Selecting the subtree is the honest answer
 there, and it is the cost of this channel; "How selection follows fixtures"
 below lists exactly when it is paid.
 
+When the `conftest.py` is itself what changed, its previous content comes out
+of git and the fixture graph is built twice, so the same per-fixture answer
+applies to the diff:
+
+```text
+$ testsniper --nodes --list   # after editing the taxed_total fixture itself
+Changed: tests/conftest.py
+Note: tests/conftest.py is changed through taxed_total; selecting the tests that request those fixtures
+Selected: tests/test_checkout.py, tests/test_totals_report.py
+Selected (would run 2 of 19 tests):
+  tests/test_checkout.py  [fixture] requests changed fixture taxed_total from tests/conftest.py
+    1 of 13 tests: narrowed by name usage and 1 affected conftest fixture
+      test_receipt_shows_the_taxed_total
+  tests/test_totals_report.py  [fixture] requests changed fixture taxed_total from tests/conftest.py
+    1 of 3 tests: narrowed by name usage and 1 affected conftest fixture
+      test_the_taxed_total_is_rendered_as_dollars
+Selection confidence: High
+```
+
+Two of nineteen, where a changed conftest used to mean all nineteen with
+narrowing switched off. Definitions are compared as parsed syntax rather than
+as text, so a change the AST cannot see selects nothing at all:
+
+```text
+$ testsniper --list   # after adding one comment inside a fixture
+Changed: tests/conftest.py
+Selected: none
+Selected (would run 0 of 19 tests):
+Selection confidence: High
+```
+
 ## Quickstart
 
 ```bash
@@ -130,15 +161,17 @@ uv sync
 uv run bash demo.sh
 ```
 
-The demo runs in four parts. Part 1 copies the generated example project (40
+The demo runs in five parts. Part 1 copies the generated example project (40
 modules, 402 tests) to a temp directory, edits one module, and shows the
 default, `--aggressive`, and `--safe --list` selections. Part 2 copies the
 mixed example project, edits `store/pricing.py`, and shows the same change
 narrowed to individual tests by `--nodes` and by the plugin. Part 3 shows the
 file that same change reaches only through a conftest fixture. Part 4 changes a
 different module in that project, one an autouse fixture reaches, and shows the
-whole directory selected with the reason. The script checks the lines this
-README pastes and exits nonzero if any of them has drifted.
+whole directory selected with the reason. Part 5 edits the `conftest.py`
+itself, once in a fixture body and once in a comment, and shows the first
+selecting two tests and the second selecting none. The script checks the lines
+this README pastes and exits nonzero if any of them has drifted.
 
 ## Why?
 
@@ -232,7 +265,8 @@ overrode. Those names are then treated exactly like an affected import.
 The analysis refuses to narrow a file, and runs all of it, when:
 
 - the test file itself changed, or it is in an `always_run` path, or it sits
-  under a changed `conftest.py`
+  under a changed `conftest.py` whose diff could not be localized to
+  individual fixtures (see below)
 - an autouse fixture reaches the change, in the file or in an applicable
   conftest, since an autouse fixture runs for tests that never name it
 - a `pytest_*` hook in an applicable conftest reaches the change, since hooks
@@ -262,7 +296,8 @@ takes the safe one.
 
 The same fixture names decide which FILES are selected, which is a separate
 question and the one an import graph cannot answer. When a `conftest.py` that
-applies to a test file is in the change's closure:
+applies to a test file is in the change's closure, or is itself one of the
+changed files:
 
 - if the change reaches it only through ordinary fixtures, the files that ask
   for one of those fixtures are selected and the rest are not. Asking means
@@ -282,12 +317,45 @@ A file selected this way prints `[fixture]` where an imported one prints
 `[distance N]`, and node narrowing still applies to it: being selected through
 a fixture does not mean every test in the file runs.
 
+### A changed conftest.py
+
+A `conftest.py` in the change set is read the same way, with one extra input:
+its content at the revision being compared against, which `git show` supplies.
+The fixture graph is built from both versions and the difference is what the
+change reaches. A definition counts as changed when its PARSED SYNTAX moved,
+so reformatting a fixture or editing a comment inside it selects nothing.
+A docstring is not exempt: under `--doctest-modules` pytest collects doctests
+out of a `conftest.py`, so a docstring in one can be a test.
+
+Taint spreads from there the way it does from an import. A changed private
+helper taints the fixtures that call it; a changed import statement taints
+whatever reads the name it binds; a fixture that requests a changed fixture is
+changed too. A DELETED fixture is tainted by name rather than by the graph,
+since it has no definition left to walk to, and a file that still asks for it
+is selected.
+
+The whole subtree is selected, with the reason, when the diff cannot be
+localized:
+
+- module-level code changed, or unchanged module-level code reads something
+  that did, since it runs on import
+- an autouse fixture or a `pytest_*` hook changed, or was deleted
+- a star import changed, so what it binds is unknowable
+- there is no previous content (a brand new `conftest.py`), the previous
+  content does not parse, or the file was deleted
+- `select()` was called without a way to read the old content, which is how
+  the library behaves when it is used outside a git repository
+
+`--safe` takes the whole subtree whenever any fixture moved, and
+`--aggressive` ignores a changed conftest entirely and drops confidence to
+Low, both exactly as they do for an affected one.
+
 ### Modes
 
 | Mode | Selection | Changed conftest.py | Affected conftest.py | Changed config or non-Python file |
 | --- | --- | --- | --- | --- |
-| `--safe` | transitive closure, widened to every module in each changed module's package | selects its whole subtree | selects its whole subtree | selects everything, with the reason printed |
-| default | full transitive closure over the reverse import graph | selects its whole subtree | selects the files that request an affected fixture, or the subtree when the change is not fixture-shaped | ignored, confidence drops to Low with a pointer to `--safe` |
+| `--safe` | transitive closure, widened to every module in each changed module's package | selects its whole subtree when any fixture moved | selects its whole subtree | selects everything, with the reason printed |
+| default | full transitive closure over the reverse import graph | selects the files that request a fixture the diff moved, or the subtree when the diff is not fixture-shaped | selects the files that request an affected fixture, or the subtree when the change is not fixture-shaped | ignored, confidence drops to Low with a pointer to `--safe` |
 | `--aggressive` | only tests that import a changed module directly | ignored, confidence drops to Low | ignored, confidence drops to Low | ignored, confidence drops to Low |
 
 A CHANGED conftest is one in your diff. An AFFECTED one is one that imports
@@ -343,7 +411,8 @@ are for, and why CI should still run the full suite.
 ```
 src/testsniper/
   cli.py       argument parsing and output
-  gitio.py     changed files from git (working tree, staged, or vs a ref)
+  gitio.py     changed files from git (working tree, staged, or vs a ref),
+               and a changed file's content at the compared-against revision
   scanner.py   AST scan of every .py file: imports, star/dynamic flags
   graph.py     reverse import graph and BFS transitive closure
   indexer.py   test file discovery and test function counting
@@ -352,7 +421,8 @@ src/testsniper/
   usage.py     name-usage primitives: what a piece of syntax reads
   nodes.py     per-test name-usage analysis inside a selected file
   fixtures.py  which conftest fixtures a change reaches across the chain,
-               and which test files ask for them
+               including a conftest that changed itself, and which test
+               files ask for them
   plan.py      the JSON contract carrying a selection into pytest
   plugin.py    pytest plugin: deselect at collection time
   runner.py    pytest invocation on the selected files
@@ -365,9 +435,10 @@ functions inside them that read an affected import or ask for such a fixture ->
 pytest. Graph nodes are file paths, not module names, so name collisions
 (every `conftest.py`) can only over-select, never under-select.
 
-`nodes.py` and `fixtures.py` are pure: they take a root, some paths, and a set
-of affected module names, and return a verdict. Neither knows anything about
-git, pytest, or the graph that produced the affected set, and both read files
+`nodes.py` and `fixtures.py` are pure: they take a root, some paths, a set of
+affected module names, and for a changed conftest its previous content as a
+string, and return a verdict. Neither knows anything about git, pytest, or the
+graph that produced the affected set, and both read files
 through the same primitives in `usage.py`, so the in-file and cross-file
 analyses cannot drift apart on what a name means. The conftest chain is read
 once per chain during selection and the verdict is carried on the `Selection`,
@@ -409,7 +480,8 @@ graph on its own cannot see.
 - **A conftest that reaches the change for every test underneath selects its
   whole subtree.** That is an autouse fixture, a `pytest_*` hook, module-level
   code, or `pytest_plugins`, and it is the correct answer rather than a
-  heuristic: those run whether a test asks for them or not. The cost is that a
+  heuristic: those run whether a test asks for them or not. The same holds
+  when the conftest is what changed and the diff touched one of those. The cost is that a
   root `conftest.py` with an autouse fixture that touches application code will
   select the entire suite on most changes. Selection says which conftest did it
   and why, so you can see it happening; moving that fixture down the tree, or
@@ -419,6 +491,11 @@ graph on its own cannot see.
   is what `--nodes` answers, but it means a local variable that happens to
   share a conftest fixture's name will select the file. Over-selection, and it
   costs a file rather than a suite.
+- A changed `conftest.py` is diffed against one revision: the one the run
+  compares against (`HEAD`, or the revision you name). Two edits in a row
+  without a commit are one diff, which is correct, but it also means a
+  conftest changed in an earlier, already-committed commit is not in the
+  change set at all unless you point testsniper at a revision before it.
 - A file whose imports reach the change but whose tests never use them is
   dropped entirely. That is the intended behavior and it is the case most
   likely to surprise; `--list` names every selected function so you can check.

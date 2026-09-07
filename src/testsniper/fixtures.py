@@ -19,6 +19,14 @@ and to ``selector.py``, which uses ``file_requests`` below to find the test
 files that ask for one of them without importing anything affected. Those
 files are invisible to an import graph: the fixture is the only channel.
 
+A conftest can also BE the change rather than read it. Given its content at
+the revision the run compares against, this module builds the fixture graph
+from both versions and treats the definitions the diff moved as the change
+itself, so a changed conftest is answered per fixture instead of by running
+its whole subtree. Definitions are compared as parsed syntax, so a comment or
+a reformatting selects nothing; a docstring is not exempt, because pytest
+collects doctests out of a conftest under ``--doctest-modules``.
+
 It refuses, for the whole chain, when a conftest does something that applies to
 every test underneath it regardless of what any test requests:
 
@@ -30,23 +38,30 @@ every test underneath it regardless of what any test requests:
 - anything the name analysis cannot read: a dynamic import, a star import of
   the change, ``globals``/``eval``/``exec``, ``request.getfixturevalue``, an
   unresolvable relative import, or a file that does not parse
+- for a CHANGED conftest, anything its diff cannot localize: module-level code
+  that moved or that reads something which did, a changed or deleted autouse
+  fixture or hook, a changed star import, or no readable previous content
 
 A refusal is the old behavior with a reason attached, so nothing this module
 does can select fewer tests than the blunt rule did.
 
 Nothing here knows about git, pytest, or the graph that produced the affected
-set. It takes paths and a set of affected module names and returns names.
+set. It takes paths, a set of affected module names, and a changed conftest's
+previous content as a plain string, and returns names. Where that string came
+from is the caller's problem.
 """
 
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from testsniper.scanner import ModuleInfo
 from testsniper.usage import (
     LOCAL_IMPORT,
+    FuncDef,
     declares_pytest_plugins,
     fixture_info,
     has_dynamic_import,
@@ -55,6 +70,8 @@ from testsniper.usage import (
     package_parts,
     reaches,
 )
+
+_DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 # Marker standing for "this definition reads an affected import". Taint is
 # resolved with one graph walk over every conftest in the chain at once, so
@@ -74,12 +91,112 @@ class FixtureVerdict:
 
 
 @dataclass
+class _ConftestDiff:
+    """What a changed conftest's own diff means for its fixtures.
+
+    ``changed_defs`` are the top-level definitions whose parsed syntax moved,
+    seeded as the change itself. ``changed_names`` are the names a reader of
+    the file can use to reach that change: the same definitions, plus the
+    names bound by an import statement the diff touched. ``removed_names`` are
+    fixture (or definition) names the diff deleted, which no graph walk can
+    find because the node is gone, so a file that still asks for one is
+    selected on the name alone.
+    """
+
+    changed_defs: frozenset[str] = frozenset()
+    changed_names: frozenset[str] = frozenset()
+    removed_names: frozenset[str] = frozenset()
+    block: str | None = None
+
+
+def _module_statements(tree: ast.Module) -> list[str]:
+    """Module-level statements that run on import, as parsed syntax.
+
+    Definitions and imports are compared separately and more precisely.
+    Docstrings are NOT exempt, here or in a definition: under
+    ``--doctest-modules`` pytest collects doctests out of a ``conftest.py``,
+    so a docstring in one can be a test, and editing it can change a result.
+    """
+    return [
+        ast.dump(stmt)
+        for stmt in tree.body
+        if not isinstance(stmt, (*_DEF_TYPES, ast.Import, ast.ImportFrom))
+    ]
+
+
+def _bound_names(stmt: ast.Import | ast.ImportFrom) -> set[str]:
+    """The module-level names an import statement binds."""
+    return {alias.asname or alias.name.split(".")[0] for alias in stmt.names}
+
+
+def _diff_conftest(relpath: str, old_source: str | None, tree: ast.Module) -> _ConftestDiff:
+    """Which of a changed conftest's definitions the diff actually touched.
+
+    Definitions are compared as PARSED SYNTAX, not as text, so rewrapping a
+    line or editing a comment inside a fixture does not select the tests that
+    ask for it. Anything the comparison cannot localize is a block, which is
+    the old whole-subtree behavior with a reason attached.
+    """
+    if old_source is None:
+        return _ConftestDiff(block=f"{relpath} has no previous content to compare against")
+    try:
+        old = ast.parse(old_source, filename=relpath)
+    except (SyntaxError, ValueError):
+        return _ConftestDiff(block=f"the previous content of {relpath} could not be parsed")
+    if declares_pytest_plugins(old) or has_dynamic_import(old):
+        return _ConftestDiff(block=f"the previous content of {relpath} could not be analyzed")
+
+    if _module_statements(old) != _module_statements(tree):
+        return _ConftestDiff(block=f"module-level code in {relpath} changed; it runs on import")
+
+    old_imports = [s for s in old.body if isinstance(s, ast.Import | ast.ImportFrom)]
+    new_imports = [s for s in tree.body if isinstance(s, ast.Import | ast.ImportFrom)]
+    shared = {ast.dump(s) for s in old_imports} & {ast.dump(s) for s in new_imports}
+    changed_names: set[str] = set()
+    for stmt in (*old_imports, *new_imports):
+        if ast.dump(stmt) in shared:
+            continue
+        if any(alias.name == "*" for alias in stmt.names):
+            return _ConftestDiff(block=f"a star import in {relpath} changed")
+        changed_names |= _bound_names(stmt)
+
+    old_defs = {s.name: s for s in old.body if isinstance(s, _DEF_TYPES)}
+    new_defs = {s.name: s for s in tree.body if isinstance(s, _DEF_TYPES)}
+    changed_defs = {
+        name
+        for name, node in new_defs.items()
+        if name not in old_defs or ast.dump(old_defs[name]) != ast.dump(node)
+    }
+
+    removed: set[str] = set()
+    for name, node in old_defs.items():
+        if name in new_defs:
+            continue
+        info = fixture_info(node) if isinstance(node, FuncDef) else None
+        if info is not None and info.autouse:
+            return _ConftestDiff(block=f"autouse fixture {info.name} was removed from {relpath}")
+        if info is None and isinstance(node, FuncDef) and name.startswith("pytest_"):
+            return _ConftestDiff(block=f"hook {name} was removed from {relpath}")
+        removed.add(info.name if info is not None else name)
+
+    return _ConftestDiff(
+        changed_defs=frozenset(changed_defs),
+        changed_names=frozenset(changed_names | changed_defs),
+        removed_names=frozenset(removed),
+    )
+
+
+@dataclass
 class _Level:
     """One conftest.py in the chain, indexed."""
 
     relpath: str
     defs: dict[str, set[str]] = field(default_factory=dict)
     affected_names: set[str] = field(default_factory=set)
+    # Definitions this file's own diff moved, seeded as the change itself.
+    changed_defs: set[str] = field(default_factory=set)
+    # Fixture names the diff deleted, tainted by name because the node is gone.
+    removed_names: set[str] = field(default_factory=set)
     # Requested fixture name -> the function that defines it.
     fixtures: dict[str, str] = field(default_factory=dict)
     # Defining function -> the fixture name it is requested as, for spotting
@@ -90,9 +207,19 @@ class _Level:
 
 
 def _index_conftest(
-    root: Path, relpath: str, affected: set[str], module: str
+    root: Path,
+    relpath: str,
+    affected: set[str],
+    module: str,
+    old_source: str | None = None,
+    is_changed: bool = False,
 ) -> tuple[_Level | None, str | None]:
-    """Index one conftest, or explain why its subtree cannot be narrowed."""
+    """Index one conftest, or explain why its subtree cannot be narrowed.
+
+    ``is_changed`` says the file is itself in the change set, in which case
+    ``old_source`` is its previous content (``None`` when git could not
+    produce one) and its own diff is a second source of taint.
+    """
     try:
         source = (root / relpath).read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=relpath)
@@ -117,6 +244,16 @@ def _index_conftest(
         return None, f"{relpath} reads names dynamically ({index.module_usage.opaque_why})"
     if reaches(index.module_usage.names, index.defs, level.affected_names):
         return None, f"module-level code in {relpath} uses an affected import"
+
+    if is_changed:
+        diff = _diff_conftest(relpath, old_source, tree)
+        if diff.block is not None:
+            return None, diff.block
+        level.affected_names |= diff.changed_names
+        if reaches(index.module_usage.names, index.defs, level.affected_names):
+            return None, f"module-level code in {relpath} reads something the diff changed"
+        level.changed_defs = set(diff.changed_defs)
+        level.removed_names = set(diff.removed_names)
 
     level.defs = index.defs
     for func in index.functions:
@@ -159,6 +296,11 @@ def _build_graph(levels: list[_Level]) -> dict[str, set[str]]:
         for name, deps in level.defs.items():
             node = f"{depth}:{name}"
             edges = graph.setdefault(node, set())
+            # A definition the diff moved IS the change, not a reader of it.
+            # Methods are keyed "Class::self.name", so a changed class seeds
+            # every method it defines.
+            if name in level.changed_defs or name.split("::")[0] in level.changed_defs:
+                edges.add(_AFFECTED)
             own = level.provides.get(name)
             for dep in deps:
                 if dep in level.affected_names:
@@ -175,16 +317,32 @@ def analyze_conftests(
     conftests: list[str],
     affected: set[str],
     infos: dict[str, ModuleInfo],
+    old_sources: Mapping[str, str | None] | None = None,
 ) -> FixtureVerdict:
     """Work out which fixtures in a conftest chain reach the change.
 
     ``conftests`` is the chain that applies to one test file, outermost first,
     which is the order pytest resolves them in.
+
+    A conftest can reach the change two ways, and this handles both in one
+    walk. It can READ something affected, which is the import graph's answer.
+    Or it can BE part of the change, in which case ``old_sources`` carries its
+    previous content and its own diff says which of its definitions moved. A
+    changed conftest with no entry in ``old_sources`` is not treated as
+    changed; the caller decides which files it is diffing.
     """
+    old_sources = old_sources or {}
     levels: list[_Level] = []
     for relpath in conftests:
         module = infos[relpath].module if relpath in infos else relpath
-        level, block = _index_conftest(root, relpath, affected, module)
+        level, block = _index_conftest(
+            root,
+            relpath,
+            affected,
+            module,
+            old_source=old_sources.get(relpath),
+            is_changed=relpath in old_sources,
+        )
         if level is None:
             return FixtureVerdict(block=block or f"{relpath} could not be analyzed")
         levels.append(level)
@@ -215,6 +373,10 @@ def analyze_conftests(
             visible[name] = (depth, func)
 
     tainted = {name for name, (depth, func) in visible.items() if reached(depth, func)}
+    # A deleted fixture has no node left to walk to, so its name is tainted
+    # directly: a file that still asks for it is affected by the deletion.
+    for level in levels:
+        tainted |= level.removed_names
     return FixtureVerdict(tainted=frozenset(tainted))
 
 

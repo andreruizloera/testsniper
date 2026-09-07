@@ -64,6 +64,19 @@ def changed_files(root: Path, ref: str | None = None, staged: bool = False) -> l
     return sorted(f for f in cleaned if not _is_generated(f))
 
 
+def file_at_ref(root: Path, relpath: str, ref: str = "HEAD") -> str | None:
+    """The contents of a file at a revision, or None when it is not there.
+
+    A file that the revision does not have (a new file, or one git cannot
+    show for any other reason) is not an error here: the caller uses the
+    absence as the answer.
+    """
+    try:
+        return _git(root, "show", f"{ref}:{relpath}")
+    except GitError:
+        return None
+
+
 def _is_generated(relpath: str) -> bool:
     """Skip build artifacts (pyc files, virtualenvs) even when untracked."""
     parts = PurePosixPath(relpath).parts

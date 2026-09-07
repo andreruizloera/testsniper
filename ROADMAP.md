@@ -24,13 +24,18 @@ select individual test functions. The cross-file fixture graph shipped after
 it, and then file-level selection through that graph: a test file that imports
 nothing affected and reaches the change only through a conftest fixture is now
 selected, and a conftest that reaches the change for every test underneath
-selects its subtree. The items below are what none of that does yet.
+selects its subtree. Reading a CHANGED conftest through its own diff shipped
+after that: its previous content comes from git, the fixture graph is built
+from both versions, and only the fixtures the diff moved select tests. The
+items below are what none of that does yet.
 
-- Read a CHANGED conftest.py the way an affected one is read. Today a changed
-  conftest selects its whole subtree and switches narrowing off for it, because
-  the graph can only read its fixtures at their new content and cannot tell
-  which of them the diff actually touched. Reading the old content out of git
-  and diffing the fixture graphs would narrow it to the fixtures that moved.
+- Diff a changed conftest against more than one revision, so a conftest edited
+  in an earlier commit is read as changed too. Today the comparison is against
+  exactly the revision the run diffs against.
+- Attribute a changed conftest's diff to individual TESTS rather than to files,
+  by asking which fixtures each test function requests. `--nodes` already
+  narrows inside a selected file using the same names; what it does not do is
+  use them to drop a file whose tests all request something else.
 - Fixture awareness for plugin-provided fixtures, which no amount of AST
   reading can attribute to a test. `pytest_plugins` is a refusal today; an
   installed plugin's fixtures are invisible.

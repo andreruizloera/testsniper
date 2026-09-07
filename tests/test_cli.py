@@ -8,7 +8,7 @@ import pytest
 from conftest import SAMPLE_PROJECT, git, git_repo, write_tree
 
 from testsniper.cli import main
-from testsniper.gitio import GitError, changed_files, repo_root
+from testsniper.gitio import GitError, changed_files, file_at_ref, repo_root
 
 
 @pytest.fixture
@@ -160,3 +160,84 @@ def test_cli_propagates_pytest_failure(
     assert main([]) != 0
     out = capsys.readouterr().out
     assert "failed" in out
+
+
+def test_file_at_ref_returns_content_and_none(sample_repo: Path) -> None:
+    original = (sample_repo / "pkg/core.py").read_text()
+    (sample_repo / "pkg/core.py").write_text("def core() -> int:\n    return 2\n")
+    assert file_at_ref(sample_repo, "pkg/core.py") == original
+    assert file_at_ref(sample_repo, "pkg/nothing.py") is None
+
+
+def test_cli_narrows_a_changed_conftest_to_the_fixtures_that_moved(
+    sample_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The end-to-end path: git supplies the old content, selection diffs it."""
+    write_tree(
+        sample_repo,
+        {
+            "tests/conftest.py": (
+                "import pytest\n"
+                "\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def hot():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def cold():\n"
+                "    return 2\n"
+            ),
+            "tests/test_hot.py": "def test_hot(hot) -> None:\n    assert hot\n",
+            "tests/test_cold.py": "def test_cold(cold) -> None:\n    assert cold\n",
+        },
+    )
+    git(sample_repo, "add", "-A")
+    git(sample_repo, "commit", "-q", "-m", "fixtures")
+
+    conftest = sample_repo / "tests/conftest.py"
+    conftest.write_text(conftest.read_text().replace("    return 1\n", "    return 11\n"))
+
+    assert main(["--list"]) == 0
+    out = capsys.readouterr().out
+    assert "requests changed fixture hot from tests/conftest.py" in out
+    assert "tests/test_cold.py" not in out
+
+
+def test_cli_changed_conftest_uses_the_ref_as_the_baseline(
+    sample_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With an explicit revision, the old content comes from that revision."""
+    write_tree(
+        sample_repo,
+        {
+            "tests/conftest.py": (
+                "import pytest\n"
+                "\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def hot():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def cold():\n"
+                "    return 2\n"
+            ),
+            "tests/test_hot.py": "def test_hot(hot) -> None:\n    assert hot\n",
+            "tests/test_cold.py": "def test_cold(cold) -> None:\n    assert cold\n",
+        },
+    )
+    git(sample_repo, "add", "-A")
+    git(sample_repo, "commit", "-q", "-m", "fixtures")
+
+    conftest = sample_repo / "tests/conftest.py"
+    conftest.write_text(conftest.read_text().replace("    return 2\n", "    return 22\n"))
+    git(sample_repo, "add", "-A")
+    git(sample_repo, "commit", "-q", "-m", "cold moved")
+
+    assert main(["HEAD~1", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "requests changed fixture cold from tests/conftest.py" in out
+    assert "tests/test_hot.py" not in out

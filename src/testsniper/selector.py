@@ -21,6 +21,12 @@ PYTEST_CONFIG_FILES: frozenset[str] = frozenset(
 _LEVELS = {"High": 0, "Medium": 1, "Low": 2}
 
 
+class OldSource(Protocol):
+    """The previous content of a changed file, or None if there is none."""
+
+    def __call__(self, relpath: str) -> str | None: ...
+
+
 class AddTest(Protocol):
     """The one way a run records a selected test file."""
 
@@ -44,10 +50,10 @@ class SelectedTest:
     reason: str
     # Why node narrowing may not remove tests from this file, when it may not.
     # Set when a reason to select it is not something per-test name usage can
-    # refine: an always_run path, a changed conftest.py (whose fixtures the
-    # graph can only read at their new content), or a conftest that reaches
-    # the change for every test underneath. Kept separately from ``reason``
-    # because a file can be selected for one reason and run whole for another.
+    # refine: an always_run path, a conftest whose diff could not be localized
+    # to individual fixtures, or a conftest that reaches the change for every
+    # test underneath. Kept separately from ``reason`` because a file can be
+    # selected for one reason and run whole for another.
     whole_file: str | None = None
     # Selected through a conftest fixture rather than an import. Distance is
     # None for these, the same as always_run, but they are not the same thing
@@ -111,8 +117,15 @@ def select(
     mode: Mode,
     config: Config,
     infos: dict[str, ModuleInfo] | None = None,
+    old_source: OldSource | None = None,
 ) -> Selection:
-    """Select the test files affected by the changed files."""
+    """Select the test files affected by the changed files.
+
+    ``old_source`` returns the previous content of a changed file, or None
+    when the revision being compared against does not have it. It is the only
+    thing here that knows a revision exists; without it a changed
+    ``conftest.py`` cannot be diffed and falls back to its whole subtree.
+    """
     if infos is None:
         infos = scan_repo(root)
     test_rels = index_tests(root, infos, config)
@@ -208,22 +221,30 @@ def select(
         else:
             add(rel, d, f"imports it transitively (distance {d})")
 
-    if conftests:
-        if mode == "aggressive":
-            sel.degrade(
-                "Low",
-                "changed conftest.py ignored in aggressive mode; its whole subtree may be affected",
-            )
-        else:
-            for conftest in conftests:
+    # A changed conftest whose previous content can be read is analyzed the
+    # way an affected one is, below. One that cannot be read at all (it is not
+    # in the scan, so it was deleted) keeps the old rule: run the subtree.
+    old_sources: dict[str, str | None] = {}
+    if conftests and mode != "aggressive":
+        for conftest in conftests:
+            if conftest in infos and old_source is not None:
+                old_sources[conftest] = old_source(conftest)
+            else:
                 subtree = str(PurePosixPath(conftest).parent)
                 reason = f"under changed {conftest}"
                 for rel in test_rels:
                     if path_is_under(rel, subtree):
                         add(rel, None, reason, whole=reason)
                 sel.notes.append(f"{conftest} changed; selecting its whole subtree")
+    if conftests and mode == "aggressive":
+        sel.degrade(
+            "Low",
+            "changed conftest.py ignored in aggressive mode; its whole subtree may be affected",
+        )
 
-    fixture_reached = _select_through_fixtures(root, sel, infos, test_rels, mode, picked, add)
+    fixture_reached = _select_through_fixtures(
+        root, sel, infos, test_rels, mode, picked, add, old_sources
+    )
 
     for path in config.always_run:
         reason = f"always_run ({path})"
@@ -253,6 +274,7 @@ def _select_through_fixtures(
     mode: Mode,
     picked: dict[str, SelectedTest],
     add: AddTest,
+    old_sources: dict[str, str | None],
 ) -> set[str]:
     """Select test files that reach the change only through a conftest fixture.
 
@@ -275,7 +297,8 @@ def _select_through_fixtures(
     reaching no test.
     """
     known = {rel for rel in infos if PurePosixPath(rel).name == "conftest.py"}
-    affected_conftests = sorted(c for c in known if c in sel.affected_files)
+    in_play = sel.affected_files | set(old_sources)
+    affected_conftests = sorted(c for c in known if c in in_play)
     if not affected_conftests:
         return set()
     if mode == "aggressive":
@@ -290,15 +313,22 @@ def _select_through_fixtures(
     notes: dict[tuple[str, ...], str] = {}
     for rel in test_rels:
         chain = tuple(c for c in conftests_for(rel) if c in known)
-        hit = [c for c in chain if c in sel.affected_files]
+        hit = [c for c in chain if c in in_play]
         if not hit:
             continue
         if chain not in sel.fixture_verdicts:
             sel.fixture_verdicts[chain] = analyze_conftests(
-                root, list(chain), sel.affected_modules, infos
+                root,
+                list(chain),
+                sel.affected_modules,
+                infos,
+                old_sources={c: old_sources[c] for c in chain if c in old_sources},
             )
         verdict = sel.fixture_verdicts[chain]
         nearest = hit[-1]
+        # The nearest conftest that carried the change either changed itself
+        # or reads something that did, and the reason should say which.
+        kind = "changed" if nearest in old_sources else "affected"
         was_picked = rel in picked
 
         if verdict.block is not None:
@@ -315,13 +345,13 @@ def _select_through_fixtures(
             add(
                 rel,
                 None,
-                f"under affected {nearest}, whose fixtures reach the change",
+                f"under {kind} {nearest}, whose fixtures reach the change",
                 via_fixture=True,
             )
             reached.update(hit)
             if not was_picked:
                 notes[chain] = (
-                    f"{nearest} is affected through {names}; safe mode selects its whole subtree"
+                    f"{nearest} is {kind} through {names}; safe mode selects its whole subtree"
                 )
             continue
 
@@ -334,7 +364,7 @@ def _select_through_fixtures(
             add(
                 rel,
                 None,
-                f"{request.unreadable}, so it may request an affected fixture",
+                f"{request.unreadable}, so it may request a {kind} fixture",
                 via_fixture=True,
             )
         else:
@@ -342,12 +372,12 @@ def _select_through_fixtures(
             add(
                 rel,
                 None,
-                f"requests affected fixture {asked} from {nearest}",
+                f"requests {kind} fixture {asked} from {nearest}",
                 via_fixture=True,
             )
         if not was_picked:
             notes[chain] = (
-                f"{nearest} is affected through {names};"
+                f"{nearest} is {kind} through {names};"
                 " selecting the tests that request those fixtures"
             )
 

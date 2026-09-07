@@ -10,7 +10,7 @@ from pathlib import Path
 from testsniper import __version__
 from testsniper import plan as plan_mod
 from testsniper.config import load_config
-from testsniper.gitio import GitError, changed_files, repo_root
+from testsniper.gitio import GitError, changed_files, file_at_ref, repo_root
 from testsniper.nodes import FileNodes, narrow_selection
 from testsniper.runner import run_pytest
 from testsniper.scanner import scan_repo
@@ -114,7 +114,17 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(root)
     infos = scan_repo(root)
-    sel = select(root, changed, mode, config, infos)
+    # The revision the change is measured against, which is what a changed
+    # file's previous content has to come from.
+    base = args.ref or "HEAD"
+    sel = select(
+        root,
+        changed,
+        mode,
+        config,
+        infos,
+        old_source=lambda relpath: file_at_ref(root, relpath, base),
+    )
     nodes = narrow_selection(root, sel, infos) if args.nodes else None
 
     if not sel.changed:

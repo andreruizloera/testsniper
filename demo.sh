@@ -15,6 +15,10 @@
 # Part 4 changes a module that the conftest's autouse fixture reaches, which
 # applies to every test underneath it, so the whole directory is selected and
 # narrowing gives up with the reason.
+#
+# Part 5 changes the conftest.py itself, twice: once in one fixture body, and
+# once in a comment. The old content comes out of git, so the first selects
+# the tests that ask for that fixture and the second selects nothing.
 set -euo pipefail
 
 if ! command -v testsniper >/dev/null 2>&1; then
@@ -27,9 +31,13 @@ root="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+setup_n=0
 setup() {
-    cp -R "$root/examples/$1" "$tmp/$1"
-    cd "$tmp/$1"
+    # A fresh copy per call, so two parts using the same example project do
+    # not nest one inside the other.
+    setup_n=$((setup_n + 1))
+    cp -R "$root/examples/$1" "$tmp/$setup_n-$1"
+    cd "$tmp/$setup_n-$1"
     git init -q -b main
     git add -A
     git -c user.name=demo -c user.email=demo@example.com \
@@ -89,6 +97,47 @@ echo "\$ testsniper --nodes --list   # after changing store/receipts.py instead"
 autouse_out="$(testsniper --nodes --list)"
 echo "$autouse_out"
 
+echo
+echo "### Part 5: a changed conftest.py, read through its own diff"
+echo
+echo "The conftest is the change. Its previous content comes from git, so the"
+echo "fixture graph can be built twice and compared: only taxed_total moved."
+echo
+setup mixed_project
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("tests/conftest.py")
+path.write_text(
+    path.read_text().replace(
+        "    return order_total(basket)",
+        "    return order_total(basket) + 0",
+    )
+)
+EOF
+echo "\$ testsniper --nodes --list"
+changed_out="$(testsniper --nodes --list)"
+echo "$changed_out"
+echo
+echo "And the same file with only a comment added, which changes no behavior:"
+echo
+git checkout -q -- tests/conftest.py
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("tests/conftest.py")
+path.write_text(
+    path.read_text().replace(
+        "    return list(BASKET)",
+        "    # the basket is copied so a test cannot mutate the module constant\n"
+        "    return list(BASKET)",
+    )
+)
+EOF
+echo "\$ testsniper --list"
+comment_out="$(testsniper --list)"
+echo "$comment_out"
+
 # The README pastes these lines. Fail loudly rather than let them drift.
 expect() {
     if ! printf '%s' "$1" | grep -qF -- "$2"; then
@@ -105,5 +154,13 @@ expect "$file_out" \
 expect "$autouse_out" \
     "tests/test_shipping_rules.py  [fixture] autouse fixture _fresh_currency"
 expect "$autouse_out" "all tests: autouse fixture _fresh_currency in tests/conftest.py reaches the change"
+expect "$changed_out" \
+    "Note: tests/conftest.py is changed through taxed_total; selecting the tests that request those fixtures"
+expect "$changed_out" "Selected (would run 2 of 19 tests):"
+expect "$changed_out" \
+    "tests/test_checkout.py  [fixture] requests changed fixture taxed_total from tests/conftest.py"
+expect "$changed_out" "test_receipt_shows_the_taxed_total"
+expect "$comment_out" "Changed: tests/conftest.py"
+expect "$comment_out" "Selected: none"
 echo
 echo "Demo checks passed."

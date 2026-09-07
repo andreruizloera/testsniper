@@ -242,7 +242,11 @@ def narrow_selection(
 
         chain = tuple(c for c in conftests_for(rel) if c in known_conftests)
         tainted: frozenset[str] = frozenset()
-        if any(c in selection.affected_files for c in chain):
+        # A verdict selection already computed covers both ways a conftest can
+        # carry the change: reading something affected, or having changed
+        # itself. Only the first can be recomputed here, so a cached verdict
+        # always wins over a fresh one.
+        if chain in selection.fixture_verdicts or any(c in selection.affected_files for c in chain):
             if chain not in selection.fixture_verdicts:
                 selection.fixture_verdicts[chain] = analyze_conftests(
                     root, list(chain), selection.affected_modules, infos
