@@ -29,10 +29,16 @@ def _narrow(
     relpath: str = "tests/test_it.py",
     module: str = "test_it",
     fixtures: set[str] | None = None,
+    symbols: dict[str, frozenset[str]] | None = None,
 ) -> FileNodes:
     write_tree(tmp_path, {relpath: source})
     return narrow_file(
-        tmp_path, relpath, affected or {"pkg.changed"}, module, fixtures=fixtures or set()
+        tmp_path,
+        relpath,
+        affected or {"pkg.changed"},
+        module,
+        fixtures=fixtures or set(),
+        symbols=symbols,
     )
 
 
@@ -749,3 +755,72 @@ def test_an_unaffected_conftest_leaves_narrowing_alone(sample_project: Path) -> 
     entry = nodes["tests/test_core.py"]
     assert entry.narrowed
     assert entry.reason == "narrowed by name usage"
+
+
+# Symbol-level narrowing. The affected set names a MODULE; a symbol map names
+# which of that module's own symbols the change reached, which is one unit
+# finer. A module absent from the map keeps the older, coarser answer.
+
+
+def test_an_import_of_an_unaffected_symbol_selects_nothing(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "from pkg.changed import quiet\n\n\ndef test_uses_quiet():\n    assert quiet()\n",
+        symbols={"pkg.changed": frozenset({"loud"})},
+    )
+    assert nodes.narrowed
+    assert _names(nodes) == set()
+
+
+def test_an_import_of_an_affected_symbol_still_selects(tmp_path: Path) -> None:
+    nodes = _narrow(
+        tmp_path,
+        "from pkg.changed import quiet, loud\n"
+        "\n"
+        "\n"
+        "def test_uses_quiet():\n"
+        "    assert quiet()\n"
+        "\n"
+        "\n"
+        "def test_uses_loud():\n"
+        "    assert loud()\n",
+        symbols={"pkg.changed": frozenset({"loud"})},
+    )
+    assert _names(nodes) == {"test_uses_loud"}
+
+
+def test_a_module_absent_from_the_symbol_map_keeps_every_symbol(tmp_path: Path) -> None:
+    """A downstream module has no diff of its own, so it is not in the map."""
+    nodes = _narrow(
+        tmp_path,
+        "from pkg.other import helper\n\n\ndef test_uses_helper():\n    assert helper()\n",
+        affected={"pkg.changed", "pkg.other"},
+        symbols={"pkg.changed": frozenset({"loud"})},
+    )
+    assert _names(nodes) == {"test_uses_helper"}
+
+
+def test_a_plain_module_import_is_not_narrowed_by_symbols(tmp_path: Path) -> None:
+    """`import pkg.changed` binds the module, and attribute reads are opaque.
+
+    Which symbol `pkg.changed.quiet()` touches is an ast.Attribute this
+    analysis does not trace back to a name, so the honest answer is the
+    coarser one.
+    """
+    nodes = _narrow(
+        tmp_path,
+        "import pkg.changed\n\n\ndef test_uses_quiet():\n    assert pkg.changed.quiet()\n",
+        symbols={"pkg.changed": frozenset({"loud"})},
+    )
+    assert _names(nodes) == {"test_uses_quiet"}
+
+
+def test_an_affected_submodule_survives_a_symbol_map(tmp_path: Path) -> None:
+    """`from pkg import changed` imports a MODULE, not a symbol of pkg."""
+    nodes = _narrow(
+        tmp_path,
+        "from pkg import changed\n\n\ndef test_uses_it():\n    assert changed.quiet()\n",
+        affected={"pkg.changed"},
+        symbols={"pkg": frozenset()},
+    )
+    assert _names(nodes) == {"test_uses_it"}

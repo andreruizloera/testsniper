@@ -236,7 +236,11 @@ def test_testsniper_flag_analyzes_the_working_tree(pytester: pytest.Pytester) ->
     _make_project(pytester)
     _git_init(pytester.path)
     (pytester.path / "pkg" / "changed.py").write_text(
-        "def build():\n    return 1\n\n\ndef extra():\n    return 3\n", encoding="utf-8"
+        # build() itself is rewritten, so the change reaches the tests that
+        # call it. Adding `extra` alone would reach nothing: see
+        # test_adding_an_unused_function_reaches_no_test.
+        "def build():\n    value = 1\n    return value\n\n\ndef extra():\n    return 3\n",
+        encoding="utf-8",
     )
     result = pytester.runpytest("--testsniper")
     # The three tests that reach pkg.changed, with the parametrized one
@@ -251,6 +255,24 @@ def test_testsniper_flag_analyzes_the_working_tree(pytester: pytest.Pytester) ->
     )
 
 
+def test_adding_an_unused_function_reaches_no_test(pytester: pytest.Pytester) -> None:
+    """A new function nothing calls cannot change what any existing test sees.
+
+    The file-level answer is unchanged: tests/test_mixed.py still imports
+    pkg.changed and is still selected. Reading the changed module's own diff
+    is what says which of its symbols moved, and `build` is not one of them,
+    so no test that imports `build` is affected.
+    """
+    _make_project(pytester)
+    _git_init(pytester.path)
+    (pytester.path / "pkg" / "changed.py").write_text(
+        "def build():\n    return 1\n\n\ndef extra():\n    return 3\n", encoding="utf-8"
+    )
+    result = pytester.runpytest("--testsniper")
+    result.assert_outcomes(deselected=8)
+    result.stdout.fnmatch_lines(["*selected 0 of 8 collected tests*"])
+
+
 def test_no_changes_deselects_everything(pytester: pytest.Pytester) -> None:
     _make_project(pytester)
     _git_init(pytester.path)
@@ -263,7 +285,11 @@ def test_aggressive_mode_is_honoured(pytester: pytest.Pytester) -> None:
     _make_project(pytester)
     _git_init(pytester.path)
     (pytester.path / "pkg" / "changed.py").write_text(
-        "def build():\n    return 1\n\n\ndef extra():\n    return 3\n", encoding="utf-8"
+        # build() itself is rewritten, so the change reaches the tests that
+        # call it. Adding `extra` alone would reach nothing: see
+        # test_adding_an_unused_function_reaches_no_test.
+        "def build():\n    value = 1\n    return value\n\n\ndef extra():\n    return 3\n",
+        encoding="utf-8",
     )
     result = pytester.runpytest("--testsniper", "--testsniper-mode=aggressive")
     result.assert_outcomes(passed=5, deselected=3)

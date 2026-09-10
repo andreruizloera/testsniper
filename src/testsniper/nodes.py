@@ -40,6 +40,7 @@ from testsniper.usage import (
     DEF_TYPES,
     LOCAL_IMPORT,
     FuncDef,
+    SymbolMap,
     changed_imports,
     collect_usage,
     fixture_info,
@@ -256,6 +257,7 @@ def narrow_file(
     fixtures: Iterable[str] = (),
     old_source: str | None = None,
     is_changed: bool = False,
+    symbols: SymbolMap | None = None,
 ) -> FileNodes:
     """Decide which test functions in one file reach the affected modules.
 
@@ -268,6 +270,12 @@ def narrow_file(
     (``None`` when there is none) and its own diff is a second source of
     taint: the tests it moved are selected, and the helpers and fixtures it
     moved select the tests that read them.
+
+    ``symbols`` narrows the affected set one unit further, from the changed
+    MODULE to the symbols in it the change reaches, so ``from pricing.core
+    import line_total`` stops counting as affected when only
+    ``price_with_tax`` moved. A module absent from the map keeps the older
+    answer, which is that importing any name from it is affected.
     """
     try:
         source = (root / relpath).read_text(encoding="utf-8", errors="replace")
@@ -280,14 +288,14 @@ def narrow_file(
     if has_dynamic_import(tree):
         return FileNodes(relpath, False, "the file imports dynamically")
 
-    affected_names, blocked = module_bindings(tree, pkg_parts, affected)
+    affected_names, blocked = module_bindings(tree, pkg_parts, affected, symbols)
     if blocked:
         return FileNodes(relpath, False, blocked.format(where="this file"))
     affected_names.add(LOCAL_IMPORT)
     tainted_fixtures = set(fixtures)
     affected_names |= tainted_fixtures
 
-    index = index_module(tree, pkg_parts, affected)
+    index = index_module(tree, pkg_parts, affected, symbols)
     if index.module_usage.opaque:
         why = index.module_usage.opaque_why
         return FileNodes(relpath, False, f"the file reads names dynamically ({why})")
@@ -337,7 +345,7 @@ def narrow_file(
     nodes = FileNodes(relpath, True, _narrowed_reason(tainted_fixtures, diff is not None))
     for key, node, classes in _test_functions(tree.body):
         nodes.known.add(key)
-        usage = collect_usage(node, pkg_parts, affected)
+        usage = collect_usage(node, pkg_parts, affected, symbols)
         prefix = "::".join(classes) + "::" if classes else ""
         names = qualify(usage.names, prefix)
         if classes:
@@ -406,7 +414,11 @@ def narrow_selection(
         if chain in selection.fixture_verdicts or any(c in selection.affected_files for c in chain):
             if chain not in selection.fixture_verdicts:
                 selection.fixture_verdicts[chain] = analyze_conftests(
-                    root, list(chain), selection.affected_modules, infos
+                    root,
+                    list(chain),
+                    selection.affected_modules,
+                    infos,
+                    symbols=selection.affected_symbols,
                 )
             verdict = selection.fixture_verdicts[chain]
             # A block outranks the file's own selection reason: it is the more
@@ -429,5 +441,6 @@ def narrow_selection(
             fixtures=tainted,
             old_source=selection.changed_test_sources.get(rel),
             is_changed=is_changed,
+            symbols=selection.affected_symbols,
         )
     return out

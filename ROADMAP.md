@@ -52,9 +52,20 @@ the tests that read them. The items below are what none of that does yet.
   time. Today each is answered on its own and the two sets are unioned, which
   can only over-select, but a test dropped by one and kept by the other is
   kept.
-- Narrow on the changed symbol, not just the changed module: a test that uses
-  only `pricing.line_total` does not need to run when only
-  `pricing.price_with_tax` changed.
+- Carry symbol narrowing past the FIRST import hop. Today a changed module's
+  own diff says which of its symbols moved, so a test importing only
+  `pricing.line_total` is dropped when only `pricing.price_with_tax` changed.
+  A module merely downstream of the change has no diff of its own, so all of
+  its symbols stay affected: `store.orders` re-exports the taint wholesale.
+  Doing it means propagating a symbol set ACROSS the import graph, deciding
+  per intermediate module which of its own symbols read an affected symbol of
+  its dependency, which is the same intra-module reachability `symbols.py`
+  already computes, run at every node of the closure rather than at the
+  changed file only.
+- Resolve `package.module.name()` attribute reads back to a symbol, so a plain
+  `import package.module` can be narrowed the way `from package.module import
+  name` now is. Today the attribute chain is not tracked and that import keeps
+  the whole module affected.
 - Follow `self.attr` set in a fixture or `setup_method`, which the class-level
   propagation currently only approximates.
 - Hybrid mode: consume a coverage map (pytest-cov contexts) when one

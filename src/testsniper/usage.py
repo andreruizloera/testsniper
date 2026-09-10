@@ -12,10 +12,17 @@ Nothing here does I/O. Callers pass in a parsed tree and get back names.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from testsniper.scanner import resolve_from
+
+# Dotted module name -> the symbols in it a change reaches. A module that is
+# affected but absent from such a map has ALL of its symbols affected, which
+# is what every caller here meant before a changed module's own diff could be
+# read. ``symbols.py`` produces these; nothing in this module produces one.
+SymbolMap = Mapping[str, frozenset[str]]
 
 # Pseudo-name recorded when a function imports an affected module locally. It
 # is seeded into the affected-name set, so a function-local import selects its
@@ -53,7 +60,12 @@ def is_affected(dotted: str, affected: set[str], *, with_prefixes: bool = False)
     return False
 
 
-def from_import_is_affected(module: str, name: str, affected: set[str]) -> bool:
+def from_import_is_affected(
+    module: str,
+    name: str,
+    affected: set[str],
+    symbols: SymbolMap | None = None,
+) -> bool:
     """Whether ``from <module> import <name>`` binds something affected.
 
     The module must be affected *exactly*, not merely be a package that
@@ -61,8 +73,20 @@ def from_import_is_affected(module: str, name: str, affected: set[str]) -> bool:
     ``pkg.changed``. What does reach it is the submodule itself
     (``from pkg import changed``), or a package whose own ``__init__`` is in
     the closure because it re-exports from the change.
+
+    ``symbols`` narrows the first of those. When it names ``module``, the
+    change was localized to that module's own symbols, so this import binds
+    something affected only if ``name`` is one of them. A module absent from
+    the map keeps the older answer, which is that all of its symbols are
+    affected. The submodule reading is unaffected either way: ``pkg.changed``
+    is a module, not a symbol of ``pkg``.
     """
-    return module in affected or is_affected(f"{module}.{name}", affected)
+    if module in affected:
+        if symbols is None or module not in symbols:
+            return True
+        if name in symbols[module]:
+            return True
+    return is_affected(f"{module}.{name}", affected)
 
 
 def qualify(names: set[str], prefix: str) -> set[str]:
@@ -103,7 +127,12 @@ def _string_args(call: ast.Call) -> list[str]:
     return [a.value for a in call.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
 
 
-def collect_usage(node: ast.AST, pkg_parts: list[str], affected: set[str]) -> Usage:
+def collect_usage(
+    node: ast.AST,
+    pkg_parts: list[str],
+    affected: set[str],
+    symbols: SymbolMap | None = None,
+) -> Usage:
     """Every name read anywhere inside a syntax tree.
 
     Parameters count as names, so a fixture is reached from the test that
@@ -145,13 +174,16 @@ def collect_usage(node: ast.AST, pkg_parts: list[str], affected: set[str]) -> Us
                 if alias.name == "*":
                     if resolved in affected:
                         usage.names.add(LOCAL_IMPORT)
-                elif from_import_is_affected(resolved, alias.name, affected):
+                elif from_import_is_affected(resolved, alias.name, affected, symbols):
                     usage.names.add(LOCAL_IMPORT)
     return usage
 
 
 def module_bindings(
-    tree: ast.Module, pkg_parts: list[str], affected: set[str]
+    tree: ast.Module,
+    pkg_parts: list[str],
+    affected: set[str],
+    symbols: SymbolMap | None = None,
 ) -> tuple[set[str], str | None]:
     """Module-level import bindings whose target is affected.
 
@@ -159,6 +191,12 @@ def module_bindings(
     attributed to individual names precisely enough to narrow on. The reason
     carries a ``{where}`` placeholder so the caller can name the file the way
     its own output reads.
+
+    ``symbols`` refines only the from-import case, where the bound name IS the
+    symbol. A plain ``import pkg.changed`` binds the module object, and every
+    attribute read off it is an ``ast.Attribute`` this analysis does not track
+    back to a name, so which symbol a user of that binding touches is not
+    knowable here and the whole module stays affected.
     """
     bound: set[str] = set()
     for node in tree.body:
@@ -180,7 +218,7 @@ def module_bindings(
                     if resolved in affected:
                         return bound, f"star import from affected module {resolved} in {{where}}"
                     continue
-                if from_import_is_affected(resolved, alias.name, affected):
+                if from_import_is_affected(resolved, alias.name, affected, symbols):
                     bound.add(alias.asname or alias.name)
     return bound, None
 
@@ -340,7 +378,12 @@ class ModuleIndex:
     methods: dict[str, list[FuncDef]] = field(default_factory=dict)
 
 
-def index_module(tree: ast.Module, pkg_parts: list[str], affected: set[str]) -> ModuleIndex:
+def index_module(
+    tree: ast.Module,
+    pkg_parts: list[str],
+    affected: set[str],
+    symbols: SymbolMap | None = None,
+) -> ModuleIndex:
     """Index a module's definitions, so name usage can propagate through them."""
     index = ModuleIndex()
 
@@ -350,7 +393,7 @@ def index_module(tree: ast.Module, pkg_parts: list[str], affected: set[str]) -> 
         method_names: list[str] = []
         for stmt in node.body:
             if isinstance(stmt, FuncDef):
-                stmt_usage = collect_usage(stmt, pkg_parts, affected)
+                stmt_usage = collect_usage(stmt, pkg_parts, affected, symbols)
                 method_names.append(stmt.name)
                 index.methods.setdefault(prefix, []).append(stmt)
                 index.defs.setdefault(f"{prefix}self.{stmt.name}", set()).update(
@@ -361,9 +404,9 @@ def index_module(tree: ast.Module, pkg_parts: list[str], affected: set[str]) -> 
             elif isinstance(stmt, ast.ClassDef):
                 shared.merge(record_class(stmt, f"{prefix}{stmt.name}::"))
             elif not isinstance(stmt, ast.Import | ast.ImportFrom):
-                shared.merge(collect_usage(stmt, pkg_parts, affected))
+                shared.merge(collect_usage(stmt, pkg_parts, affected, symbols))
         for decorator in node.decorator_list:
-            shared.merge(collect_usage(decorator, pkg_parts, affected))
+            shared.merge(collect_usage(decorator, pkg_parts, affected, symbols))
         # Class-body state is shared by every method defined on the class.
         for name in method_names:
             index.defs.setdefault(f"{prefix}self.{name}", set()).update(
@@ -375,7 +418,7 @@ def index_module(tree: ast.Module, pkg_parts: list[str], affected: set[str]) -> 
     outer_shared: list[Usage] = []
     for stmt in tree.body:
         if isinstance(stmt, FuncDef):
-            usage = collect_usage(stmt, pkg_parts, affected)
+            usage = collect_usage(stmt, pkg_parts, affected, symbols)
             index.functions.append(stmt)
             index.defs.setdefault(stmt.name, set()).update(usage.names)
             if usage.opaque:
@@ -383,7 +426,7 @@ def index_module(tree: ast.Module, pkg_parts: list[str], affected: set[str]) -> 
         elif isinstance(stmt, ast.ClassDef):
             outer_shared.append(record_class(stmt, f"{stmt.name}::"))
         elif not isinstance(stmt, ast.Import | ast.ImportFrom):
-            index.module_usage.merge(collect_usage(stmt, pkg_parts, affected))
+            index.module_usage.merge(collect_usage(stmt, pkg_parts, affected, symbols))
 
     for shared in outer_shared:
         if shared.opaque:

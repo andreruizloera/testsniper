@@ -63,6 +63,7 @@ from testsniper.usage import (
     DEF_TYPES,
     LOCAL_IMPORT,
     FuncDef,
+    SymbolMap,
     changed_imports,
     declares_pytest_plugins,
     fixture_info,
@@ -187,6 +188,7 @@ def _index_conftest(
     module: str,
     old_source: str | None = None,
     is_changed: bool = False,
+    symbols: SymbolMap | None = None,
 ) -> tuple[_Level | None, str | None]:
     """Index one conftest, or explain why its subtree cannot be narrowed.
 
@@ -206,14 +208,14 @@ def _index_conftest(
         return None, f"{relpath} sets pytest_plugins, which can add fixtures from anywhere"
 
     pkg_parts = package_parts(relpath, module)
-    bound, blocked = module_bindings(tree, pkg_parts, affected)
+    bound, blocked = module_bindings(tree, pkg_parts, affected, symbols)
     if blocked:
         return None, blocked.format(where=relpath)
 
     level = _Level(relpath=relpath)
     level.affected_names = bound | {LOCAL_IMPORT}
 
-    index = index_module(tree, pkg_parts, affected)
+    index = index_module(tree, pkg_parts, affected, symbols)
     if index.module_usage.opaque:
         return None, f"{relpath} reads names dynamically ({index.module_usage.opaque_why})"
     if reaches(index.module_usage.names, index.defs, level.affected_names):
@@ -292,6 +294,7 @@ def analyze_conftests(
     affected: set[str],
     infos: dict[str, ModuleInfo],
     old_sources: Mapping[str, str | None] | None = None,
+    symbols: SymbolMap | None = None,
 ) -> FixtureVerdict:
     """Work out which fixtures in a conftest chain reach the change.
 
@@ -316,6 +319,7 @@ def analyze_conftests(
             module,
             old_source=old_sources.get(relpath),
             is_changed=relpath in old_sources,
+            symbols=symbols,
         )
         if level is None:
             return FixtureVerdict(block=block or f"{relpath} could not be analyzed")

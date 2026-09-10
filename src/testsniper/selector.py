@@ -11,6 +11,8 @@ from testsniper.fixtures import FixtureVerdict, analyze_conftests, conftests_for
 from testsniper.graph import build_reverse_graph, importers_of, reverse_closure
 from testsniper.indexer import count_tests_in_file, index_tests, is_test_file, path_is_under
 from testsniper.scanner import ModuleInfo, module_name, scan_repo
+from testsniper.symbols import changed_symbols
+from testsniper.usage import package_parts
 
 Mode = Literal["safe", "default", "aggressive"]
 
@@ -109,6 +111,16 @@ class Selection:
     # says a changed test file may be narrowed by its own diff; absence keeps
     # the older answer, which is to run all of it.
     changed_test_sources: dict[str, str | None] = field(default_factory=dict)
+    # Changed module (dotted) -> the symbols in it the change reaches, read
+    # from that module's own diff. Only CHANGED modules can appear: a module
+    # that is merely downstream of one has no diff of its own to read, so all
+    # of its symbols stay affected. A module absent from this map keeps that
+    # same older answer, which is what makes the map safe to consult
+    # unconditionally.
+    affected_symbols: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Changed module -> why its symbols could not be read, for the one line of
+    # output that says a narrowing did not happen and names the reason.
+    symbol_blocks: dict[str, str] = field(default_factory=dict)
 
     def degrade(self, level: str, reason: str) -> None:
         if _LEVELS[level] > _LEVELS[self.confidence]:
@@ -249,6 +261,7 @@ def select(
         for rel in changed_modules:
             if rel in test_set and rel in infos:
                 sel.changed_test_sources[rel] = old_source(rel)
+        _read_changed_symbols(root, sel, infos, test_set, changed_modules, old_source)
 
     if conftests and mode == "aggressive":
         sel.degrade(
@@ -278,6 +291,40 @@ def select(
     sel.selected_tests = sum(counts.get(t.relpath, 0) for t in sel.tests)
     _score_confidence(sel, infos, mode, config_changes, other_changes)
     return sel
+
+
+def _read_changed_symbols(
+    root: Path,
+    sel: Selection,
+    infos: dict[str, ModuleInfo],
+    test_set: set[str],
+    changed_modules: list[str],
+    old_source: OldSource,
+) -> None:
+    """Read each changed module's own diff for the symbols the change reaches.
+
+    A test file is skipped: its diff is already read as ``changed_test_sources``
+    and answers a different question, which of its OWN tests moved. A module
+    that cannot be localized records why, and stays fully affected by being
+    absent from the map rather than by any flag.
+    """
+    for rel in changed_modules:
+        if rel in test_set or rel not in infos:
+            continue
+        info = infos[rel]
+        if info.parse_error:
+            sel.symbol_blocks[rel] = f"{rel} could not be parsed"
+            continue
+        try:
+            new_source = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            sel.symbol_blocks[rel] = f"{rel} could not be read"
+            continue
+        result = changed_symbols(rel, old_source(rel), new_source, package_parts(rel, info.module))
+        if result.block is None:
+            sel.affected_symbols[info.module] = result.names
+        else:
+            sel.symbol_blocks[rel] = result.block
 
 
 def _select_through_fixtures(
@@ -337,6 +384,7 @@ def _select_through_fixtures(
                 sel.affected_modules,
                 infos,
                 old_sources={c: old_sources[c] for c in chain if c in old_sources},
+                symbols=sel.affected_symbols,
             )
         verdict = sel.fixture_verdicts[chain]
         nearest = hit[-1]

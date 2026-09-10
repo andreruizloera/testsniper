@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Demo, in four parts.
+# Demo, in seven parts.
 #
 # Part 1 uses the generated fixture project (402 tests) to show file-level
 # selection: change one module, run only the test files that can reach it.
@@ -22,6 +22,14 @@
 # Part 6 changes a TEST file itself, and reads it the same way: an added test
 # is the only test selected, and an edited helper method selects the methods
 # that call it.
+#
+# Part 7 shows the unit below the module: a change to one symbol of a changed
+# module does not reach a test that imports a different symbol of it, and a
+# function nothing calls reaches no existing test at all.
+#
+# Every change below edits an EXISTING definition unless a part is about
+# adding one, because appending an inert function is now correctly a change
+# that reaches nothing, and would demonstrate nothing.
 set -euo pipefail
 
 if ! command -v testsniper >/dev/null 2>&1; then
@@ -50,7 +58,14 @@ setup() {
 echo "### Part 1: file-level selection, 402-test fixture project"
 echo
 setup fixture_project
-printf '\n\ndef extra() -> int:\n    return 42\n' >> fixture_lib/c4/layer1.py
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("fixture_lib/c4/layer1.py")
+# Behaviour-preserving on purpose: the point of part 1 is which tests are
+# SELECTED, and a demo whose tests fail would say nothing about that.
+path.write_text(path.read_text().replace("return base_value() + 1", "return 1 + base_value()"))
+EOF
 
 echo "\$ testsniper"
 testsniper
@@ -65,8 +80,17 @@ echo
 echo "### Part 2: node-level selection, mixed project"
 echo
 setup mixed_project
-printf '\n\ndef bulk_discount(cents: int) -> int:\n    return cents * 9 // 10\n' \
-    >> store/pricing.py
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("store/pricing.py")
+path.write_text(
+    path.read_text().replace(
+        "    return int(cents + cents * TAX_RATE + 0.5)",
+        "    return int(cents + cents * TAX_RATE + 0.5) if cents else 0",
+    )
+)
+EOF
 
 echo "\$ testsniper --nodes --list"
 nodes_out="$(testsniper --nodes --list)"
@@ -94,8 +118,17 @@ echo "test in the directory whether it asks for it or not. So the whole"
 echo "directory is selected, including the file that imports only shipping."
 echo
 git checkout -q -- store/pricing.py
-printf '\n\ndef render_footer(note: str) -> str:\n    return f"-- {note}"\n' \
-    >> store/receipts.py
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("store/receipts.py")
+path.write_text(
+    path.read_text().replace(
+        '    _currency["symbol"] = DEFAULT_SYMBOL\n\n\ndef format_cents',
+        '    _currency.update({"symbol": DEFAULT_SYMBOL})\n\n\ndef format_cents',
+    )
+)
+EOF
 echo "\$ testsniper --nodes --list   # after changing store/receipts.py instead"
 autouse_out="$(testsniper --nodes --list)"
 echo "$autouse_out"
@@ -173,6 +206,22 @@ echo "\$ testsniper --nodes --list"
 helper_out="$(testsniper --nodes --list)"
 echo "$helper_out"
 
+echo
+echo "### Part 7: a change to one symbol does not reach a test that uses another"
+echo
+echo "tests/test_checkout.py imports both line_total and price_with_tax. The"
+echo "pricing change in part 2 rewrote price_with_tax only, and line_total does"
+echo "not call it, so test_line_total_multiplies is not in that list above."
+echo "Adding a whole new function is the same argument taken further: nothing"
+echo "calls it, so no existing test can see it."
+echo
+setup mixed_project
+printf '\n\ndef bulk_discount(cents: int) -> int:\n    return cents * 9 // 10\n' \
+    >> store/pricing.py
+echo "\$ testsniper --nodes --list   # after APPENDING a function to store/pricing.py"
+added_fn_out="$(testsniper --nodes --list)"
+echo "$added_fn_out"
+
 # The README pastes these lines. Fail loudly rather than let them drift.
 expect() {
     if ! printf '%s' "$1" | grep -qF -- "$2"; then
@@ -181,7 +230,21 @@ expect() {
         exit 1
     fi
 }
-expect "$nodes_out" "7 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+# A claim that narrowing DROPPED a test is a claim about what is absent, and
+# only an absence check can test it. `expect` alone would pass on a run that
+# selected everything.
+expect_absent() {
+    if printf '%s' "$1" | grep -qF -- "$2"; then
+        echo
+        echo "DEMO FAILED: expected NOT to find: $2"
+        exit 1
+    fi
+}
+expect "$nodes_out" "6 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+expect "$nodes_out" "test_price_with_tax_rounds_half_up"
+# The whole point of symbol narrowing: line_total is in the same changed
+# module and is not reached by a change to price_with_tax.
+expect_absent "$nodes_out" "test_line_total_multiplies"
 expect "$nodes_out" "test_receipt_shows_the_taxed_total"
 expect "$nodes_out" "1 of 3 tests: narrowed by name usage and 1 affected conftest fixture"
 expect "$file_out" \
@@ -202,5 +265,9 @@ expect "$added_out" "test_shipping_is_free_over_ten_kilos"
 expect "$helper_out" "2 of 13 tests: narrowed by its own diff and name usage"
 expect "$helper_out" "TestReceiptFormatting::test_amounts_are_dollars_and_cents"
 expect "$helper_out" "TestReceiptFormatting::test_header_names_the_customer"
+expect "$added_fn_out" "Selected: tests/test_checkout.py"
+expect "$added_fn_out" "3 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+expect_absent "$added_fn_out" "test_price_with_tax_rounds_half_up"
+expect_absent "$added_fn_out" "test_line_total_multiplies"
 echo
 echo "Demo checks passed."
