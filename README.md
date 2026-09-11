@@ -38,18 +38,18 @@ $ pytest --testsniper
 ============================= test session starts ==============================
 testsniper: default mode, working tree vs HEAD
 plugins: testsniper-0.1.0
-collected 23 items / 16 deselected / 7 selected
+collected 23 items / 17 deselected / 6 selected
 
-tests/test_checkout.py ......                                            [ 85%]
+tests/test_checkout.py .....                                             [ 83%]
 tests/test_totals_report.py .                                            [100%]
 
 ---------------------------------- testsniper ----------------------------------
 1 changed file(s), working tree vs HEAD
-selected 7 of 23 collected tests
-  tests/test_checkout.py: 6 of 14, narrowed by name usage and 1 affected conftest fixture
+selected 6 of 23 collected tests
+  tests/test_checkout.py: 5 of 14, narrowed by name usage and 1 affected conftest fixture
   tests/test_totals_report.py: 1 of 3, narrowed by name usage and 1 affected conftest fixture
 selection confidence: High
-======================= 7 passed, 16 deselected in 0.17s =======================
+======================= 6 passed, 17 deselected in 0.14s =======================
 ```
 
 Both blocks are real `demo.sh` output. The second is trimmed of the platform,
@@ -65,6 +65,12 @@ A module is a coarse unit too. `tests/test_checkout.py` imports both
 works out which of its top-level names the change can reach, and treats an
 import of any other name as innocent.
 
+The same question is asked at every hop, not just the first. `store/orders.py`
+imports pricing and has no diff of its own, so there is nothing to read there;
+what testsniper does instead is work out which of *its* names read an affected
+name of something it imports. `order_total` calls `price_with_tax` and
+`subtotal` does not, so a test that calls `subtotal` is dropped as well.
+
 Taken one step further, appending a whole new function to a module reaches
 nothing at all. The file is still selected, because it still imports the
 changed module, and every test inside it is dropped:
@@ -72,29 +78,30 @@ changed module, and every test inside it is dropped:
 ```text
 $ testsniper --nodes --list   # after APPENDING a function to store/pricing.py
 Changed: store/pricing.py
-Note: tests/conftest.py is affected through taxed_total; selecting the tests that request those fixtures
-Selected: tests/test_checkout.py, tests/test_totals_report.py
-Selected (would run 4 of 19 tests):
+Selected: tests/test_checkout.py
+Selected (would run 0 of 19 tests):
   tests/test_checkout.py  [distance 1] imports a changed module
-    3 of 13 tests: narrowed by name usage and 1 affected conftest fixture
-      test_order_total_applies_tax
-      test_receipt_shows_the_taxed_total
-      test_subtotal_sums_every_line
-  tests/test_totals_report.py  [fixture] requests affected fixture taxed_total from tests/conftest.py
-    1 of 3 tests: narrowed by name usage and 1 affected conftest fixture
-      test_the_taxed_total_is_rendered_as_dollars
+    0 of 13 tests: narrowed by name usage
 Selection confidence: High
 ```
 
-The three that survive do not import the new function either. They reach
-pricing through `store/orders.py` and through the conftest fixture, and neither
-of those is the changed module, so neither is narrowed this way.
+Nothing calls the new function anywhere in the import graph, so no existing
+test can see it, and `tests/test_totals_report.py` is not selected at all: the
+conftest fixture that used to carry the change to it reaches pricing through
+`store/orders.py`, and nothing in `store/orders.py` reads the new name either.
 
 Definitions are compared as parsed syntax, so reflowing a line or editing a
 comment inside a function reaches nothing, and a docstring edit does count,
-since `--doctest-modules` can collect one. Usage propagates inside the changed
-module: if `line_total` called `price_with_tax`, editing `price_with_tax`
-brings both names back.
+since `--doctest-modules` can collect one. Usage propagates inside a module the
+same way it propagates between modules: if `line_total` called
+`price_with_tax`, editing `price_with_tax` brings both names back.
+
+Propagation is refused rather than guessed wherever the answer would not be
+sound: a star import, an unresolved relative import, a dynamic import, a
+module-level `__getattr__`, module-level code that reads something affected, an
+import cycle, and a package whose `__init__` is affected and runs on the way to
+a submodule. A refused module keeps every one of its symbols affected, and the
+run says which modules those were and why rather than silently widening.
 
 ### Fixtures the test file never imports
 
@@ -108,15 +115,14 @@ $ testsniper --nodes --list
 Changed: store/pricing.py
 Note: tests/conftest.py is affected through taxed_total; selecting the tests that request those fixtures
 Selected: tests/test_checkout.py, tests/test_totals_report.py
-Selected (would run 7 of 19 tests):
+Selected (would run 6 of 19 tests):
   tests/test_checkout.py  [distance 1] imports a changed module
-    6 of 13 tests: narrowed by name usage and 1 affected conftest fixture
+    5 of 13 tests: narrowed by name usage and 1 affected conftest fixture
       test_order_total_applies_tax
       test_price_with_tax_of_zero_is_zero
       test_price_with_tax_rejects_a_negative_price
       test_price_with_tax_rounds_half_up
       test_receipt_shows_the_taxed_total
-      test_subtotal_sums_every_line
   tests/test_totals_report.py  [fixture] requests affected fixture taxed_total from tests/conftest.py
     1 of 3 tests: narrowed by name usage and 1 affected conftest fixture
       test_the_taxed_total_is_rendered_as_dollars
@@ -336,9 +342,11 @@ and one deselection path rather than drifting apart.
 
 Inside a selected file, testsniper resolves each import to a module, marks the
 bindings whose target is affected by the change, and asks per test function
-whether any name it reads traces back to one of them. For a module that is
-itself in the change set, "affected" is decided per symbol rather than per
-module, from that module's own diff. Usage follows the file's
+whether any name it reads traces back to one of them. "Affected" is decided per
+symbol rather than per module: from its own diff for a module in the change
+set, and from which of its names read an affected name of something it imports
+for a module downstream of one. A module that is both gets the union of the
+two, because a name can move for either reason. Usage follows the file's
 own definitions, so a helper, a fixture reached through the parameter that
 requests it, a `pytest.mark.usefixtures("name")` mark, and a
 `self.other_method()` call all propagate.
@@ -369,11 +377,17 @@ The analysis refuses to narrow a file, and runs all of it, when:
   `request.getfixturevalue()`, has an unresolvable relative import, or does not
   parse
 
-A changed module's symbols are read the same way, and the same care applies:
-every symbol in it stays affected when its module-level code changed or reads
-something the diff changed (that runs on import), when a star import or a
-dynamic import moved, when it declares a module-level `__getattr__`, when it is
-new, or when either revision does not parse.
+A module's symbols are read the same way, and the same care applies: every
+symbol in it stays affected when its module-level code changed or reads
+something affected (that runs on import), when a star import or a dynamic
+import moved, when it declares a module-level `__getattr__`, when it is new, or
+when either revision does not parse. A module downstream of the change adds
+three refusals of its own: an import cycle, which has no dependency order to
+resolve symbols in; a dotted name that more than one file is importable as,
+which cannot be attributed to either; and an import whose parent package is
+affected and not itself readable, since `from a.b import c` runs
+`a/__init__.py` and binds no name that stands for it. Each refusal is printed
+with the module it applies to.
 
 Anything the analysis did not recognize is kept, not dropped: an item that has
 no matching test function in the AST (a doctest, an item from a custom
@@ -517,7 +531,8 @@ src/testsniper/
   selector.py  modes, conftest/config triggers, always_run, confidence,
                and the files reached only through a fixture
   usage.py     name-usage primitives: what a piece of syntax reads
-  symbols.py   which symbols in a changed module its own diff can reach
+  symbols.py   which symbols of a module a change reaches: from its own
+               diff, and from what it imports, propagated across the graph
   nodes.py     per-test name-usage analysis inside a selected file,
                including a test file that changed itself
   fixtures.py  which conftest fixtures a change reaches across the chain,
@@ -532,9 +547,10 @@ The pipeline: diff -> changed modules -> reverse import graph (who imports
 whom, transitively) -> test files in the closure, ranked by distance, plus the
 files that request a fixture the change reaches -> optionally, the test
 functions inside them that read an affected import or ask for such a fixture ->
-pytest. Each changed module is separately read for the symbols its own diff
-reaches, which refines what "an affected import" means without touching the
-graph. Graph nodes are file paths, not module names, so name collisions
+pytest. Every affected module is separately read for the symbols the change
+reaches in it, in dependency order so that each one is answered after the
+modules it imports, which refines what "an affected import" means without
+touching the graph. Graph nodes are file paths, not module names, so name collisions
 (every `conftest.py`) can only over-select, never under-select.
 
 `nodes.py` and `fixtures.py` are pure: they take a root, some paths, a set of
@@ -555,7 +571,7 @@ deterministically by `scripts/gen_fixture.py`: 10 independent import chains of
 its files uses the same module, so node narrowing has nothing to remove there.
 `examples/mixed_project/` exists for that: one small store whose checkout test
 file mixes pricing, shipping, and formatting tests, so a change to
-`price_with_tax` reaches 6 of its 13 test functions and none of the shipping
+`price_with_tax` reaches 5 of its 13 test functions and none of the shipping
 file. Its `tests/conftest.py`
 is mixed the same way, with one fixture a pricing change reaches, one it does
 not, and one autouse fixture that a receipts change does reach. A third test
@@ -602,10 +618,14 @@ graph on its own cannot see.
 - A changed test file is diffed by parsed syntax, so moving a test within its
   file selects nothing, and renaming one selects the new name only. Neither is
   wrong, but neither is what a reader of the text diff would predict.
-- **Symbol narrowing applies only to a module that is ITSELF in the change
-  set.** A module merely downstream of one has no diff of its own to read, so
-  every symbol in it stays affected and a test importing any of them is
-  selected. That is why the three surviving tests above survive.
+- Symbol narrowing crosses the import graph, but it gives up on a whole module
+  rather than guess when the answer would not be sound: a star import, an
+  unresolved relative import, a dynamic import, a module-level `__getattr__`,
+  module-level code that reads something affected, an import cycle, two files
+  importable under the same dotted name, and a package whose `__init__` is
+  affected and runs on the way to a submodule. Every symbol in a module it
+  gives up on stays affected. The run names those modules and the reason, so
+  the widening is visible rather than silent.
 - Symbol narrowing needs the bound name to BE the symbol, which is the
   `from module import name` form. A plain `import package.module` binds the
   module object, and `package.module.name()` is an attribute read this analysis
@@ -622,9 +642,9 @@ graph on its own cannot see.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Highlights: PyPI release, carrying symbol
-narrowing past the first import hop, import graph caching, and coverage-map
-hybrid selection.
+See [ROADMAP.md](ROADMAP.md). Highlights: PyPI release, resolving
+`package.module.name()` attribute reads back to a symbol, import graph caching,
+and coverage-map hybrid selection.
 
 ## Contributing
 

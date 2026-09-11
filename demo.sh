@@ -212,8 +212,12 @@ echo
 echo "tests/test_checkout.py imports both line_total and price_with_tax. The"
 echo "pricing change in part 2 rewrote price_with_tax only, and line_total does"
 echo "not call it, so test_line_total_multiplies is not in that list above."
+echo "The same question is asked one hop further out: store/orders.py imports"
+echo "pricing, and only its order_total reads price_with_tax, so the test that"
+echo "calls its subtotal is dropped too."
 echo "Adding a whole new function is the same argument taken further: nothing"
-echo "calls it, so no existing test can see it."
+echo "calls it anywhere in the import graph, so no existing test can see it,"
+echo "and the answer is zero tests rather than a file's worth."
 echo
 setup mixed_project
 printf '\n\ndef bulk_discount(cents: int) -> int:\n    return cents * 9 // 10\n' \
@@ -240,11 +244,14 @@ expect_absent() {
         exit 1
     fi
 }
-expect "$nodes_out" "6 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+expect "$nodes_out" "5 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
 expect "$nodes_out" "test_price_with_tax_rounds_half_up"
 # The whole point of symbol narrowing: line_total is in the same changed
 # module and is not reached by a change to price_with_tax.
 expect_absent "$nodes_out" "test_line_total_multiplies"
+# One hop further out: subtotal lives in store/orders.py, which the change
+# reaches, and subtotal itself never reads price_with_tax.
+expect_absent "$nodes_out" "test_subtotal_sums_every_line"
 expect "$nodes_out" "test_receipt_shows_the_taxed_total"
 expect "$nodes_out" "1 of 3 tests: narrowed by name usage and 1 affected conftest fixture"
 expect "$file_out" \
@@ -266,7 +273,7 @@ expect "$helper_out" "2 of 13 tests: narrowed by its own diff and name usage"
 expect "$helper_out" "TestReceiptFormatting::test_amounts_are_dollars_and_cents"
 expect "$helper_out" "TestReceiptFormatting::test_header_names_the_customer"
 expect "$added_fn_out" "Selected: tests/test_checkout.py"
-expect "$added_fn_out" "3 of 13 tests: narrowed by name usage and 1 affected conftest fixture"
+expect "$added_fn_out" "0 of 13 tests: narrowed by name usage"
 expect_absent "$added_fn_out" "test_price_with_tax_rounds_half_up"
 expect_absent "$added_fn_out" "test_line_total_multiplies"
 echo

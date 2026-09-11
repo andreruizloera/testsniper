@@ -7,7 +7,7 @@ preventing; keeping one that cannot is merely slow.
 
 from __future__ import annotations
 
-from testsniper.symbols import changed_symbols
+from testsniper.symbols import changed_symbols, propagate_symbols
 
 BASE = '''"""Two unrelated helpers."""
 
@@ -175,3 +175,132 @@ def test_module_level_code_that_reads_names_dynamically_blocks() -> None:
     result = _symbols(new, old=old)
     assert not result.usable
     assert "reads names dynamically" in (result.block or "")
+
+
+MID = '''"""A module downstream of the change, with no diff of its own."""
+
+from pricing.core import line_total, price_with_tax
+
+
+def taxed_line(unit, quantity):
+    return price_with_tax(line_total(unit, quantity))
+
+
+def plain_line(unit, quantity):
+    return line_total(unit, quantity)
+'''
+
+
+def _propagated(
+    source: str = MID,
+    affected: set[str] | None = None,
+    symbols: dict[str, frozenset[str]] | None = None,
+    **kwargs,
+):
+    return propagate_symbols(
+        "orders/mid.py",
+        source,
+        ["orders"],
+        affected if affected is not None else {"pricing.core"},
+        symbols if symbols is not None else {"pricing.core": frozenset({"price_with_tax"})},
+        **kwargs,
+    )
+
+
+def test_only_the_definitions_that_read_the_changed_symbol_propagate() -> None:
+    """The caveat this feature exists for: narrowing used to die at hop one.
+
+    plain_line calls line_total, which the change never reached, so nothing
+    downstream of plain_line can see the change either.
+    """
+    result = _propagated()
+    assert result.usable
+    assert result.names == {"price_with_tax", "taxed_line"}
+
+
+def test_a_downstream_module_that_reads_nothing_affected_is_empty_not_blocked() -> None:
+    """Being in the closure means importing an affected MODULE, not a SYMBOL.
+
+    An empty answer here is the honest one, and refusing instead would put the
+    wholesale re-export straight back.
+    """
+    result = _propagated(symbols={"pricing.core": frozenset({"unrelated"})})
+    assert result.usable
+    assert result.names == frozenset()
+
+
+def test_an_unreadable_upstream_module_taints_every_importer_of_its_names() -> None:
+    """A module absent from the map has all of its symbols affected."""
+    result = _propagated(symbols={})
+    assert result.usable
+    assert result.names == {"price_with_tax", "line_total", "taxed_line", "plain_line"}
+
+
+def test_a_module_that_is_changed_and_downstream_unions_both_answers() -> None:
+    """The under-selection this fix is really about.
+
+    plain_line moved in this module's own diff; taxed_line reads a symbol that
+    moved upstream. Either answer alone drops tests the change reaches.
+    """
+    result = _propagated(seeds=frozenset({"plain_line"}))
+    assert result.usable
+    assert result.names == {"price_with_tax", "taxed_line", "plain_line"}
+
+
+def test_module_level_code_reading_an_affected_import_blocks() -> None:
+    source = MID + "\nREADY = price_with_tax(100)\n"
+    result = _propagated(source)
+    assert not result.usable
+    assert "runs on import" in str(result.block)
+
+
+def test_a_function_local_import_taints_only_its_own_function() -> None:
+    source = '''"""Nothing at module level reaches the change."""
+
+
+def uses_it(amount):
+    from pricing.core import price_with_tax
+
+    return price_with_tax(amount)
+
+
+def does_not(amount):
+    return amount
+'''
+    result = _propagated(source)
+    assert result.usable
+    assert result.names == {"uses_it"}
+
+
+def test_a_star_import_from_an_affected_module_blocks() -> None:
+    result = _propagated("from pricing.core import *\n\n\ndef f():\n    return 1\n")
+    assert not result.usable
+    assert "star import" in str(result.block)
+
+
+def test_an_affected_parent_package_blocks_a_submodule_import() -> None:
+    """Importing pricing.core runs pricing/__init__.py first.
+
+    No name bound by the import stands for that side effect, so there is
+    nothing for usage tracking to follow and narrowing must refuse.
+    """
+    result = _propagated(affected={"pricing.core", "pricing"}, symbols={})
+    assert not result.usable
+    assert "runs on import" in str(result.block)
+
+
+def test_an_affected_parent_with_readable_symbols_does_not_block() -> None:
+    """A package whose own symbols were read has module-level code known inert.
+
+    Without this exclusion the common re-exporting __init__ would make every
+    submodule import in the repository unnarrowable.
+    """
+    result = _propagated(
+        affected={"pricing.core", "pricing"},
+        symbols={
+            "pricing.core": frozenset({"price_with_tax"}),
+            "pricing": frozenset({"price_with_tax"}),
+        },
+    )
+    assert result.usable
+    assert result.names == {"price_with_tax", "taxed_line"}

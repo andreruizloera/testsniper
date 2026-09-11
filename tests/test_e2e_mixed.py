@@ -100,9 +100,9 @@ def test_nodes_run_drops_the_tests_that_do_not_use_pricing(mixed_repo: Path) -> 
     proc = _run(mixed_repo, "--nodes")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "Running 7 of 19 tests (9 more dropped inside the selected files)..." in out
-    assert "7 passed, 10 deselected" in out
-    assert "Skipped: 12 (3 in unselected files, 9 deselected inside selected files)" in out
+    assert "Running 6 of 19 tests (10 more dropped inside the selected files)..." in out
+    assert "6 passed, 11 deselected" in out
+    assert "Skipped: 13 (3 in unselected files, 10 deselected inside selected files)" in out
     assert "Selection confidence: High" in out
 
 
@@ -111,8 +111,8 @@ def test_nodes_list_names_the_selected_functions(mixed_repo: Path) -> None:
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "would run 7 of 19 tests" in out
-    assert "6 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
+    assert "would run 6 of 19 tests" in out
+    assert "5 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
     # Reached directly, and through the taxed_total fixture respectively.
     assert "test_price_with_tax_rounds_half_up" in out
     assert "test_receipt_shows_the_taxed_total" in out
@@ -142,20 +142,28 @@ def test_adding_an_unused_function_reaches_no_test(mixed_repo: Path) -> None:
     """A new function nothing calls cannot change what any existing test sees.
 
     The file-level answer does not move: test_checkout.py still imports the
-    changed module and is still selected. What changes is the node-level one,
-    and the three tests that survive do so through store/orders.py and the
-    conftest fixture, neither of which is the changed module itself.
+    changed module and is still selected. The node-level answer is now zero.
+
+    It used to be three, and those three were an artifact rather than a
+    result. They reached pricing through store/orders.py and through the
+    conftest fixture that calls into it, and narrowing stopped at the first
+    import hop, so orders.py re-exported the whole change regardless of which
+    symbol of pricing actually moved. Propagating the symbol set across the
+    import graph removes them: nothing in orders.py reads bulk_discount,
+    because nothing anywhere does.
     """
     _append_unused_function(mixed_repo)
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
     assert "Selected: tests/test_checkout.py" in out
-    assert "would run 4 of 19 tests" in out
-    assert "3 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
+    assert "would run 0 of 19 tests" in out
+    assert "0 of 13 tests: narrowed by name usage" in out
     # Every test that reaches pricing only by importing it directly is gone.
     assert "test_price_with_tax_rounds_half_up" not in out
     assert "test_line_total_multiplies" not in out
+    # And so is the file that reached it only through the conftest fixture.
+    assert "tests/test_totals_report.py" not in out
 
 
 def test_plugin_narrows_a_plain_pytest_invocation(mixed_repo: Path) -> None:
@@ -164,12 +172,12 @@ def test_plugin_narrows_a_plain_pytest_invocation(mixed_repo: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
     assert "testsniper: default mode, working tree vs HEAD" in out
-    assert "selected 7 of 23 collected tests" in out
+    assert "selected 6 of 23 collected tests" in out
     assert (
-        "tests/test_checkout.py: 6 of 14, narrowed by name usage"
+        "tests/test_checkout.py: 5 of 14, narrowed by name usage"
         " and 1 affected conftest fixture" in out
     )
-    assert "7 passed, 16 deselected" in out
+    assert "6 passed, 17 deselected" in out
 
 
 def test_changing_shipping_selects_a_different_slice(mixed_repo: Path) -> None:
@@ -222,7 +230,7 @@ def test_an_affected_conftest_fixture_is_followed_across_files(mixed_repo: Path)
     proc = _run(mixed_repo, "--nodes", "--list")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
-    assert "6 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
+    assert "5 of 13 tests: narrowed by name usage and 1 affected conftest fixture" in out
     assert "test_receipt_shows_the_taxed_total" in out
     # basket is a conftest fixture too, and a pricing change does not reach it.
     assert "test_receipt_lists_every_line" not in out

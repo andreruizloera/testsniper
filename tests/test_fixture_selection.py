@@ -218,10 +218,20 @@ def test_getfixturevalue_means_the_file_may_ask_for_anything(tmp_path: Path) -> 
 
 
 def test_safe_mode_takes_the_whole_subtree(tmp_path: Path) -> None:
+    """Safe mode widens the change to the whole package, and says what that cost.
+
+    Widening makes ``pkg`` itself part of the change set, and ``pkg`` is a
+    package the conftest's own imports execute on the way to ``pkg.changed``.
+    There is no name binding that stands for that side effect, so the conftest
+    stops being narrowable at all. The file is selected whole either way; what
+    the reason records is which decision made it unnarrowable, and under
+    ``--safe`` that decision is safe mode's own widening.
+    """
     sel = _select(tmp_path, mode="safe")
     assert "tests/test_quiet.py" in _paths(sel)
     assert _picked(sel, "tests/test_quiet.py").reason == (
-        "under affected tests/conftest.py, whose fixtures reach the change"
+        "tests/conftest.py imports from pkg.changed,"
+        " and its package pkg is affected and runs on import"
     )
 
 

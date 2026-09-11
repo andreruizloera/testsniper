@@ -35,15 +35,18 @@ from dataclasses import dataclass
 
 from testsniper.usage import (
     DEF_TYPES,
+    LOCAL_IMPORT,
+    SymbolMap,
     Usage,
     changed_imports,
     collect_usage,
     has_dynamic_import,
+    module_bindings,
     module_statements,
     reaches,
 )
 
-__all__ = ["ModuleSymbols", "changed_symbols"]
+__all__ = ["ModuleSymbols", "changed_symbols", "propagate_symbols"]
 
 
 @dataclass(frozen=True)
@@ -63,30 +66,47 @@ class ModuleSymbols:
         return self.block is None
 
 
-def _symbol_reads(tree: ast.Module, pkg_parts: list[str]) -> dict[str, set[str]]:
+def _symbol_reads(
+    tree: ast.Module,
+    pkg_parts: list[str],
+    affected: set[str] | None = None,
+    symbols: SymbolMap | None = None,
+) -> dict[str, set[str]]:
     """Top-level definition name -> every name its own subtree reads.
 
     A class is one entry covering its bases, decorators, class body and every
     method, because a test that imports the class can reach any of them.
+
+    ``affected`` is passed through to ``collect_usage`` so that a definition
+    containing a FUNCTION-LOCAL import of an affected module records
+    LOCAL_IMPORT and can be tainted by it. Reading a changed module's own diff
+    has no use for that and passes nothing, which is the default.
     """
     defs: dict[str, set[str]] = {}
     for stmt in tree.body:
         if isinstance(stmt, DEF_TYPES):
-            usage = collect_usage(stmt, pkg_parts, set())
+            usage = collect_usage(stmt, pkg_parts, set(affected or ()), symbols)
             defs.setdefault(stmt.name, set()).update(usage.names)
     return defs
 
 
-def _module_usage(tree: ast.Module, pkg_parts: list[str]) -> Usage:
+def _module_usage(
+    tree: ast.Module,
+    pkg_parts: list[str],
+    affected: set[str] | None = None,
+    symbols: SymbolMap | None = None,
+) -> Usage:
     """Names read by module-level code, which runs on import.
 
     Definitions and imports are left out: they are compared one at a time and
-    more precisely.
+    more precisely. A conditional import nested inside module-level code is
+    not a top-level import statement, so it is still walked here, and
+    ``affected`` is what lets it be seen.
     """
     usage = Usage()
     for stmt in tree.body:
         if not isinstance(stmt, (*DEF_TYPES, ast.Import, ast.ImportFrom)):
-            usage.merge(collect_usage(stmt, pkg_parts, set()))
+            usage.merge(collect_usage(stmt, pkg_parts, set(affected or ()), symbols))
     return usage
 
 
@@ -151,4 +171,68 @@ def changed_symbols(
 
     names = set(seeds)
     names.update(name for name in defs if reaches({name}, defs, seeds))
+    return ModuleSymbols(names=frozenset(names))
+
+
+def propagate_symbols(
+    relpath: str,
+    source: str,
+    pkg_parts: list[str],
+    affected: set[str],
+    symbols: SymbolMap,
+    *,
+    seeds: frozenset[str] = frozenset(),
+) -> ModuleSymbols:
+    """Which top-level names of a module the change reaches THROUGH ITS IMPORTS.
+
+    ``changed_symbols`` answers this for a module that has a diff to read. A
+    module merely downstream of a change has no diff of its own, so the
+    question is the other one: which of ITS names read something that is
+    affected in a module it imports. The reachability computation is the same,
+    seeded from the imported bindings instead of from a diff.
+
+    ``seeds`` carries the names a module's OWN diff already made affected, for
+    a module that is both changed and downstream of another changed module.
+    The two answers are unioned rather than one replacing the other: a name
+    can be affected because the module's own diff touched it, or because it
+    reads something upstream that moved, and dropping either is an
+    under-selection.
+
+    Finding no affected binding at all is an ordinary answer and not a
+    refusal. A module is in the closure because it imports an affected
+    MODULE, which does not mean it reads an affected SYMBOL of it. The routes
+    that would make an empty answer a lie are refusals already: a star import,
+    an unresolved relative import, an affected parent package, a dynamic
+    import, and a module-level ``__getattr__`` all return a block from here or
+    from ``module_bindings``, and a function-local import of an affected
+    module contributes LOCAL_IMPORT and taints its own definition.
+    """
+    try:
+        tree = ast.parse(source, filename=relpath)
+    except (SyntaxError, ValueError):
+        return ModuleSymbols(block=f"{relpath} could not be parsed")
+    if has_dynamic_import(tree):
+        return ModuleSymbols(block=f"{relpath} imports dynamically")
+    if _declares_module_getattr(tree):
+        return ModuleSymbols(block=f"{relpath} defines a module-level __getattr__")
+
+    bound, why = module_bindings(tree, pkg_parts, affected, symbols)
+    if why is not None:
+        return ModuleSymbols(block=why.format(where=relpath))
+
+    defs = _symbol_reads(tree, pkg_parts, affected, symbols)
+    usage = _module_usage(tree, pkg_parts, affected, symbols)
+    if usage.opaque:
+        return ModuleSymbols(block=f"module-level code in {relpath} reads names dynamically")
+
+    # LOCAL_IMPORT is a seed but never a symbol: it taints the definition that
+    # contains the import, and is not a name anything can import from here.
+    taint = {*bound, *seeds, LOCAL_IMPORT}
+    if reaches(usage.names, defs, taint):
+        return ModuleSymbols(
+            block=f"module-level code in {relpath} reads something affected; it runs on import"
+        )
+
+    names = {*bound, *seeds}
+    names.update(name for name in defs if reaches({name}, defs, taint))
     return ModuleSymbols(names=frozenset(names))

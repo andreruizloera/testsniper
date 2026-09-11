@@ -11,7 +11,7 @@ from testsniper.fixtures import FixtureVerdict, analyze_conftests, conftests_for
 from testsniper.graph import build_reverse_graph, importers_of, reverse_closure
 from testsniper.indexer import count_tests_in_file, index_tests, is_test_file, path_is_under
 from testsniper.scanner import ModuleInfo, module_name, scan_repo
-from testsniper.symbols import changed_symbols
+from testsniper.symbols import ModuleSymbols, changed_symbols, propagate_symbols
 from testsniper.usage import package_parts
 
 Mode = Literal["safe", "default", "aggressive"]
@@ -111,15 +111,18 @@ class Selection:
     # says a changed test file may be narrowed by its own diff; absence keeps
     # the older answer, which is to run all of it.
     changed_test_sources: dict[str, str | None] = field(default_factory=dict)
-    # Changed module (dotted) -> the symbols in it the change reaches, read
-    # from that module's own diff. Only CHANGED modules can appear: a module
-    # that is merely downstream of one has no diff of its own to read, so all
-    # of its symbols stay affected. A module absent from this map keeps that
-    # same older answer, which is what makes the map safe to consult
-    # unconditionally.
+    # Affected module (dotted) -> the symbols in it the change reaches. A
+    # changed module's entry is read from its own diff; a module downstream of
+    # one gets the symbols that read an affected symbol of something it
+    # imports, and a module that is both gets the union. A module absent from
+    # this map has ALL of its symbols affected, which is the answer everything
+    # here gave before symbols could be read at all, and it is what makes the
+    # map safe to consult unconditionally.
     affected_symbols: dict[str, frozenset[str]] = field(default_factory=dict)
-    # Changed module -> why its symbols could not be read, for the one line of
-    # output that says a narrowing did not happen and names the reason.
+    # Affected file -> why its symbols could not be read. Absence from
+    # ``affected_symbols`` is what actually makes such a module fully
+    # affected; this only carries the reason, so the output can say a
+    # narrowing did not happen instead of silently not happening.
     symbol_blocks: dict[str, str] = field(default_factory=dict)
 
     def degrade(self, level: str, reason: str) -> None:
@@ -261,7 +264,7 @@ def select(
         for rel in changed_modules:
             if rel in test_set and rel in infos:
                 sel.changed_test_sources[rel] = old_source(rel)
-        _read_changed_symbols(root, sel, infos, test_set, changed_modules, old_source)
+        _resolve_symbols(root, sel, infos, reverse, dist, test_set, changed_modules, old_source)
 
     if conftests and mode == "aggressive":
         sel.degrade(
@@ -289,8 +292,30 @@ def select(
 
     sel.tests = sorted(picked.values(), key=SelectedTest.sort_key)
     sel.selected_tests = sum(counts.get(t.relpath, 0) for t in sel.tests)
+    _note_symbol_blocks(sel)
     _score_confidence(sel, infos, mode, config_changes, other_changes)
     return sel
+
+
+def _note_symbol_blocks(sel: Selection) -> None:
+    """Say out loud which modules could not be narrowed to symbols, and why.
+
+    A blocked module keeps every one of its symbols affected. That is the safe
+    answer and it is also an invisible one: the run simply selects more tests
+    and never says which decision widened it. One note, listing the first few
+    reasons, is the difference between a conservative answer and an
+    unexplained one.
+    """
+    if not sel.symbol_blocks:
+        return
+    reasons = [sel.symbol_blocks[rel] for rel in sorted(sel.symbol_blocks)]
+    shown = "; ".join(reasons[:3])
+    more = len(reasons) - 3
+    tail = f", and {more} more" if more > 0 else ""
+    sel.notes.append(
+        f"symbol narrowing gave up on {len(reasons)} module(s) ({shown}{tail});"
+        " every symbol in them stays affected"
+    )
 
 
 def _read_changed_symbols(
@@ -300,20 +325,30 @@ def _read_changed_symbols(
     test_set: set[str],
     changed_modules: list[str],
     old_source: OldSource,
-) -> None:
+    ambiguous: set[str],
+) -> dict[str, ModuleSymbols]:
     """Read each changed module's own diff for the symbols the change reaches.
 
     A test file is skipped: its diff is already read as ``changed_test_sources``
     and answers a different question, which of its OWN tests moved. A module
     that cannot be localized records why, and stays fully affected by being
     absent from the map rather than by any flag.
+
+    Returns the per-file result so the propagation pass can use a readable
+    diff as its seed instead of re-reading it. A file absent from the returned
+    map either is not a changed module or could not be localized; the two are
+    told apart by ``sel.symbol_blocks``.
     """
+    results: dict[str, ModuleSymbols] = {}
     for rel in changed_modules:
         if rel in test_set or rel not in infos:
             continue
         info = infos[rel]
         if info.parse_error:
             sel.symbol_blocks[rel] = f"{rel} could not be parsed"
+            continue
+        if info.module in ambiguous:
+            sel.symbol_blocks[rel] = _ambiguous_reason(rel, info.module)
             continue
         try:
             new_source = (root / rel).read_text(encoding="utf-8", errors="replace")
@@ -322,9 +357,130 @@ def _read_changed_symbols(
             continue
         result = changed_symbols(rel, old_source(rel), new_source, package_parts(rel, info.module))
         if result.block is None:
+            results[rel] = result
             sel.affected_symbols[info.module] = result.names
         else:
             sel.symbol_blocks[rel] = result.block
+    return results
+
+
+def _ambiguous_reason(relpath: str, module: str) -> str:
+    return (
+        f"more than one file is importable as {module},"
+        f" so symbols read from {relpath} cannot be attributed to it"
+    )
+
+
+def _symbol_order(
+    candidates: list[str], reverse: dict[str, set[str]]
+) -> tuple[list[str], list[str]]:
+    """Candidates in dependency order, plus the ones no order can cover.
+
+    A module's affected symbols depend on the answer for every module it
+    imports, so importees have to be resolved first. Import cycles have no
+    such order; the files in one are returned separately and stay fully
+    affected, which is the same answer this analysis gave before it could
+    propagate anything.
+    """
+    within = set(candidates)
+    pending: dict[str, set[str]] = {rel: set() for rel in candidates}
+    for importee in candidates:
+        for importer in reverse.get(importee, ()):
+            if importer in within:
+                pending[importer].add(importee)
+
+    ready = sorted(rel for rel, deps in pending.items() if not deps)
+    order: list[str] = []
+    while ready:
+        rel = ready.pop(0)
+        order.append(rel)
+        del pending[rel]
+        freed: list[str] = []
+        for importer in reverse.get(rel, ()):
+            if importer in pending and rel in pending[importer]:
+                pending[importer].discard(rel)
+                if not pending[importer]:
+                    freed.append(importer)
+        if freed:
+            ready = sorted([*ready, *freed])
+    return order, sorted(pending)
+
+
+def _resolve_symbols(
+    root: Path,
+    sel: Selection,
+    infos: dict[str, ModuleInfo],
+    reverse: dict[str, set[str]],
+    dist: dict[str, int],
+    test_set: set[str],
+    changed_modules: list[str],
+    old_source: OldSource,
+) -> None:
+    """Fill ``sel.affected_symbols`` for every affected module, not only changed ones.
+
+    A changed module's own diff says which of its symbols moved. A module
+    merely downstream of one has no diff, and used to keep the older answer:
+    every symbol in it is affected, so it re-exported the taint wholesale and
+    narrowing died at the first import hop. This walks the affected modules in
+    dependency order and asks each one which of ITS symbols read an affected
+    symbol of something it imports.
+
+    The two answers are unioned for a module that is both. That union is not a
+    refinement, it is a correctness fix: a changed module used to have the
+    narrow answer from its own diff REPLACE the wholesale one, which dropped
+    every symbol tainted through its imports and deselected tests that the
+    change really does reach.
+    """
+    counts: dict[str, int] = {}
+    for info in infos.values():
+        counts[info.module] = counts.get(info.module, 0) + 1
+    ambiguous = {module for module, count in counts.items() if count > 1}
+
+    own = _read_changed_symbols(root, sel, infos, test_set, changed_modules, old_source, ambiguous)
+
+    candidates = [
+        rel
+        for rel in sorted(dist)
+        if rel in infos
+        and rel not in test_set
+        and PurePosixPath(rel).name != "conftest.py"
+        and rel not in sel.symbol_blocks
+    ]
+    order, cyclic = _symbol_order(candidates, reverse)
+    for rel in cyclic:
+        sel.symbol_blocks[rel] = f"{rel} is in an import cycle, which has no dependency order"
+        sel.affected_symbols.pop(infos[rel].module, None)
+
+    for rel in order:
+        info = infos[rel]
+        if info.parse_error:
+            sel.symbol_blocks[rel] = f"{rel} could not be parsed"
+            sel.affected_symbols.pop(info.module, None)
+            continue
+        if info.module in ambiguous:
+            sel.symbol_blocks[rel] = _ambiguous_reason(rel, info.module)
+            sel.affected_symbols.pop(info.module, None)
+            continue
+        try:
+            source = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            sel.symbol_blocks[rel] = f"{rel} could not be read"
+            sel.affected_symbols.pop(info.module, None)
+            continue
+        diff_result = own.get(rel)
+        result = propagate_symbols(
+            rel,
+            source,
+            package_parts(rel, info.module),
+            sel.affected_modules,
+            sel.affected_symbols,
+            seeds=diff_result.names if diff_result is not None else frozenset(),
+        )
+        if result.block is None:
+            sel.affected_symbols[info.module] = result.names
+        else:
+            sel.symbol_blocks[rel] = result.block
+            sel.affected_symbols.pop(info.module, None)
 
 
 def _select_through_fixtures(

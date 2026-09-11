@@ -60,6 +60,43 @@ def is_affected(dotted: str, affected: set[str], *, with_prefixes: bool = False)
     return False
 
 
+def affected_parent(
+    dotted: str, affected: set[str], symbols: SymbolMap | None = None, inside: str = ""
+) -> str | None:
+    """An affected package whose IMPORT SIDE EFFECT ``dotted`` cannot be narrowed past.
+
+    ``import a.b`` and ``from a.b import c`` both run ``a/__init__.py`` before
+    anything in ``a.b``. Only STRICT prefixes count: ``dotted`` itself being
+    affected is the ordinary case every caller already handles.
+
+    A parent that appears in ``symbols`` is NOT returned, and that exclusion is
+    what keeps this from swallowing the common layout where a package
+    ``__init__`` re-exports from its submodules. Being in that map is exactly
+    the guarantee needed: both producers of it refuse when module-level code
+    changed, reads something affected, or cannot be read, so a package with a
+    usable symbol set has module-level code that is known inert, and running it
+    on the way to a submodule changes nothing. A parent absent from the map is
+    one whose import can do anything, and there is no name to track it by.
+
+    ``inside`` is the package the importing file itself sits in. A package
+    the importer is already part of is not a side effect of the import: by the
+    time ``pkg/__init__.py`` runs ``from pkg.changed import build``, ``pkg`` is
+    already executing, and by the time ``pkg/other.py`` runs at all its
+    ``__init__`` has run. Without this, a package whose ``__init__`` re-exports
+    from its own submodule would refuse to narrow itself. Nothing is lost:
+    every import that crosses INTO the package from outside is checked by this
+    same rule, where the side effect really is one.
+    """
+    parts = dotted.split(".")
+    for i in range(1, len(parts)):
+        prefix = ".".join(parts[:i])
+        if inside == prefix or inside.startswith(f"{prefix}."):
+            continue
+        if prefix in affected and (symbols is None or prefix not in symbols):
+            return prefix
+    return None
+
+
 def from_import_is_affected(
     module: str,
     name: str,
@@ -197,7 +234,15 @@ def module_bindings(
     attribute read off it is an ``ast.Attribute`` this analysis does not track
     back to a name, so which symbol a user of that binding touches is not
     knowable here and the whole module stays affected.
+
+    An import whose PARENT package is affected is a block rather than a
+    binding. ``from a.b import c`` executes ``a/__init__.py`` and then binds
+    only ``c``, and ``a``'s own symbols are not reachable through ``c``, so
+    there is no name for usage tracking to follow and no honest way to narrow.
+    ``import a.b`` is different and stays a binding: it binds ``a`` itself, so
+    every read of ``a.anything`` is a read of a name in this set.
     """
+    inside = ".".join(pkg_parts)
     bound: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.Import):
@@ -205,6 +250,13 @@ def module_bindings(
                 if alias.asname:
                     if is_affected(alias.name, affected):
                         bound.add(alias.asname)
+                    else:
+                        parent = affected_parent(alias.name, affected, symbols, inside)
+                        if parent is not None:
+                            return bound, (
+                                f"{{where}} imports {alias.name} as {alias.asname},"
+                                f" and its package {parent} is affected and runs on import"
+                            )
                 elif is_affected(alias.name, affected, with_prefixes=True):
                     bound.add(alias.name.split(".")[0])
         elif isinstance(node, ast.ImportFrom):
@@ -213,6 +265,12 @@ def module_bindings(
                 return bound, "a relative import in {where} could not be resolved"
             if resolved is None:
                 continue
+            parent = affected_parent(resolved, affected, symbols, inside)
+            if parent is not None:
+                return bound, (
+                    f"{{where}} imports from {resolved},"
+                    f" and its package {parent} is affected and runs on import"
+                )
             for alias in node.names:
                 if alias.name == "*":
                     if resolved in affected:
