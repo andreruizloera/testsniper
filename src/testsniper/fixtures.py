@@ -62,6 +62,7 @@ from testsniper.scanner import ModuleInfo
 from testsniper.usage import (
     DEF_TYPES,
     LOCAL_IMPORT,
+    SUBPROCESS_ENTRY,
     FuncDef,
     SymbolMap,
     changed_imports,
@@ -213,7 +214,7 @@ def _index_conftest(
         return None, blocked.format(where=relpath)
 
     level = _Level(relpath=relpath)
-    level.affected_names = bound | {LOCAL_IMPORT}
+    level.affected_names = bound | {LOCAL_IMPORT, SUBPROCESS_ENTRY}
 
     index = index_module(tree, pkg_parts, affected, symbols)
     if index.module_usage.opaque:

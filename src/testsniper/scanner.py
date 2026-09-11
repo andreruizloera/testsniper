@@ -4,6 +4,11 @@ Walks every Python file in the repository, records what each file imports
 (absolute imports, from-imports, and package-relative imports), and flags
 constructs that static analysis cannot fully trace: star imports, dynamic
 imports (importlib.import_module / __import__), and files that fail to parse.
+
+It also records one dependency that is not an import at all: a
+``python -m pkg`` subprocess, which is how a test exercises a command
+line rather than a function. See ``entrypoints.py`` for what that reads
+and, more importantly, what it refuses to read.
 """
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+
+from testsniper.entrypoints import subprocess_modules
 
 SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -43,6 +50,7 @@ class ModuleInfo:
     deps: set[str] = field(default_factory=set)
     candidates: set[str] = field(default_factory=set)
     star_imports: set[str] = field(default_factory=set)
+    subprocess_modules: set[str] = field(default_factory=set)
     dynamic_import: bool = False
     parse_error: bool = False
     unresolved_relative: bool = False
@@ -114,6 +122,12 @@ def parse_module(root: Path, relpath: Path) -> ModuleInfo:
             is_importlib = isinstance(func, ast.Attribute) and func.attr == "import_module"
             if is_dunder or is_importlib:
                 info.dynamic_import = True
+            # A `python -m pkg` subprocess is a dependency the import
+            # statements do not record. It is folded into deps so the
+            # reverse graph treats it as the edge it is.
+            for target in subprocess_modules(node):
+                info.subprocess_modules.add(target)
+                info.deps |= _expand_prefixes(target)
     return info
 
 

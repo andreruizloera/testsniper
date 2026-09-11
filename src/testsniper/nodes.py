@@ -39,6 +39,7 @@ from testsniper.selector import Selection
 from testsniper.usage import (
     DEF_TYPES,
     LOCAL_IMPORT,
+    SUBPROCESS_ENTRY,
     FuncDef,
     SymbolMap,
     changed_imports,
@@ -292,6 +293,7 @@ def narrow_file(
     if blocked:
         return FileNodes(relpath, False, blocked.format(where="this file"))
     affected_names.add(LOCAL_IMPORT)
+    affected_names.add(SUBPROCESS_ENTRY)
     tainted_fixtures = set(fixtures)
     affected_names |= tainted_fixtures
 

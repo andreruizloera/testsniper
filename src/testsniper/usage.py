@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from testsniper.entrypoints import subprocess_modules
 from testsniper.scanner import resolve_from
 
 # Dotted module name -> the symbols in it a change reaches. A module that is
@@ -28,6 +29,13 @@ SymbolMap = Mapping[str, frozenset[str]]
 # is seeded into the affected-name set, so a function-local import selects its
 # own function through the ordinary name-usage path and nothing else.
 LOCAL_IMPORT = "\x00local-import"
+
+# The same trick for the other route that reaches affected code without
+# binding a name: a `python -m pkg` subprocess. Kept as a SEPARATE sentinel
+# rather than folded into LOCAL_IMPORT because the two are different claims
+# about a test, and a diagnostic that cannot tell them apart is worse than
+# one extra constant.
+SUBPROCESS_ENTRY = "\x00subprocess-entry"
 
 # Builtins that make name usage unreadable. getattr is excluded on purpose: it
 # is far too common in ordinary test code to carry any signal.
@@ -177,7 +185,8 @@ def collect_usage(
     conftest. ``self.method`` is recorded as a pseudo-name so sibling methods
     resolve later, and ``pytest.mark.usefixtures("x")`` contributes ``x``,
     since that mark requests a fixture the parameter list never mentions. A
-    local import of an affected module contributes LOCAL_IMPORT.
+    local import of an affected module contributes LOCAL_IMPORT, and a
+    ``python -m`` subprocess that runs one contributes SUBPROCESS_ENTRY.
     """
     usage = Usage()
     for child in ast.walk(node):
@@ -197,6 +206,15 @@ def collect_usage(
                     usage.names.update(_string_args(child))
                 elif func.attr in _OPAQUE_CALLS:
                     usage.mark_opaque(f"request.{func.attr}")
+            # Running the project as a process reaches its code without
+            # binding any name, so it gets the same sentinel treatment as a
+            # function-local import. `with_prefixes` is on because
+            # `python -m a.b` executes package `a` on the way to `a.b`.
+            if any(
+                is_affected(target, affected, with_prefixes=True)
+                for target in subprocess_modules(child)
+            ):
+                usage.names.add(SUBPROCESS_ENTRY)
         elif isinstance(child, ast.Import):
             for alias in child.names:
                 if is_affected(alias.name, affected, with_prefixes=True):

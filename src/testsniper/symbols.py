@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from testsniper.usage import (
     DEF_TYPES,
     LOCAL_IMPORT,
+    SUBPROCESS_ENTRY,
     SymbolMap,
     Usage,
     changed_imports,
@@ -225,9 +226,10 @@ def propagate_symbols(
     if usage.opaque:
         return ModuleSymbols(block=f"module-level code in {relpath} reads names dynamically")
 
-    # LOCAL_IMPORT is a seed but never a symbol: it taints the definition that
-    # contains the import, and is not a name anything can import from here.
-    taint = {*bound, *seeds, LOCAL_IMPORT}
+    # LOCAL_IMPORT and SUBPROCESS_ENTRY are seeds but never symbols: each
+    # taints the definition that contains the import or the subprocess call,
+    # and neither is a name anything can import from here.
+    taint = {*bound, *seeds, LOCAL_IMPORT, SUBPROCESS_ENTRY}
     if reaches(usage.names, defs, taint):
         return ModuleSymbols(
             block=f"module-level code in {relpath} reads something affected; it runs on import"
