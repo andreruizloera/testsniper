@@ -242,6 +242,73 @@ star import changed, or there is no readable previous content, which is the
 case for a brand new test file. `--safe` runs a changed test file whole
 whenever it changed at all.
 
+### Tests that run the tool instead of importing it
+
+A command-line end-to-end test starts a process. It imports none of the code
+it exercises, so the import graph connects it to nothing, and a change that
+broke the command line used to select none of those tests.
+
+testsniper found this in itself. Breaking `cli.main` on the path that only a
+real invocation takes, and leaving the path the unit tests use intact, gave a
+selection that was green while the suite was not. Both blocks below are
+complete, not excerpted, and the only difference in the first three lines is
+the selection itself. The first is run at the commit before this feature:
+
+```text
+$ testsniper --list       # before: the subprocess tests are invisible
+Changed: src/testsniper/cli.py
+Note: symbol narrowing gave up on 2 module(s) (module-level code in src/testsniper/__main__.py reads something affected; it runs on import; module-level code in src/testsniper/cli.py reads something the diff changed); every symbol in them stays affected
+Selected: tests/test_cli.py
+Selected (would run 19 of 302 tests):
+  tests/test_cli.py  [distance 1] imports a changed module
+Selection confidence: High
+```
+
+`tests/test_cli.py` calls `main([...])` in process, so it passes: `19 passed`.
+The three files that run `python -m testsniper` for real were never selected,
+and the full suite reported `22 failed, 280 passed`, every one of the 22 in
+those three files. Note that the widening the `Note:` line describes did not
+help at all. It marks every symbol of `cli.py` and `__main__.py` affected, and
+still misses all 22, because what is missing is not a symbol but the edge.
+
+A `python -m` target is now read back out of the argument vector and treated
+as the dependency it is:
+
+```text
+$ testsniper --list       # after: the same break, the same repository
+Changed: src/testsniper/cli.py
+Note: symbol narrowing gave up on 2 module(s) (module-level code in src/testsniper/__main__.py reads something affected; it runs on import; module-level code in src/testsniper/cli.py reads something the diff changed); every symbol in them stays affected
+Selected: tests/test_cli.py, tests/test_cross_module_symbols.py, tests/test_e2e_fixture.py, tests/test_e2e_mixed.py, tests/test_subprocess_entrypoint.py
+Selected (would run 48 of 321 tests):
+  tests/test_cli.py  [distance 1] imports a changed module
+  tests/test_cross_module_symbols.py  [distance 2] imports it transitively (distance 2)
+  tests/test_e2e_fixture.py  [distance 2] imports it transitively (distance 2)
+  tests/test_e2e_mixed.py  [distance 2] imports it transitively (distance 2)
+  tests/test_subprocess_entrypoint.py  [distance 2] imports it transitively (distance 2)
+Selection confidence: High
+```
+
+Running that selection reports `26 failed, 22 passed`; running the whole suite
+reports `26 failed, 295 passed`. The same 26, so nothing is missed. The count
+moved from 22 to 26 because this feature's own test file did not exist in the
+before run: the failures are 6 in `test_cross_module_symbols.py`, 4 in
+`test_e2e_fixture.py` and 12 in `test_e2e_mixed.py`, unchanged from the before
+run, plus 4 in the new `test_subprocess_entrypoint.py`.
+
+The reading is deliberately narrow. The call has to be named like one of the
+`subprocess` process starters (`run`, `Popen`, `call`, `check_call`,
+`check_output`, `getoutput`, `getstatusoutput`), matched on the bare name so
+that `from subprocess import run` is seen too, which does mean a same-named
+method on something else is also read. That costs nothing, because the payoff
+is a dotted name that has to match a file in your repository to mean anything.
+Only a literal `-m` followed by a literal
+module name is matched, and `python -m pkg` records
+both `pkg` and `pkg.__main__`, since that is what the interpreter runs. A
+module name held in a variable or built with an f-string is refused rather
+than guessed at, and a shell string command is not split. A console script
+invoked by name (`subprocess.run(["mytool", ...])`) is still invisible; that
+needs the project's `[project.scripts]` table and is in ROADMAP.md.
+
 ## Quickstart
 
 ```bash
@@ -525,7 +592,11 @@ src/testsniper/
   cli.py       argument parsing and output
   gitio.py     changed files from git (working tree, staged, or vs a ref),
                and a changed file's content at the compared-against revision
-  scanner.py   AST scan of every .py file: imports, star/dynamic flags
+  scanner.py   AST scan of every .py file: imports, star/dynamic flags,
+               and python -m subprocess targets
+  entrypoints.py  reads a `python -m <module>` target back out of a
+               subprocess argument vector, and refuses everything it
+               cannot read literally
   graph.py     reverse import graph and BFS transitive closure
   indexer.py   test file discovery and test function counting
   selector.py  modes, conftest/config triggers, always_run, confidence,
@@ -583,8 +654,16 @@ graph on its own cannot see.
 
 - pytest only. File-level selection is the default; node-level selection
   needs `--nodes` or the plugin.
-- Static analysis: dynamic imports, plugin registries, and entry points
-  are invisible; the confidence rating tells you when that matters.
+- Static analysis: dynamic imports and plugin registries are invisible; the
+  confidence rating tells you when that matters.
+- A subprocess that runs the project is followed only in the
+  `python -m <module>` form, with both `-m` and the module name written as
+  string literals in the argument vector. A console script called by name,
+  a module name held in a variable or built with an f-string, and a
+  `shell=True` string command are all invisible, and invisible here means
+  under-selection rather than over-selection: the tests that exercise your
+  command line will not be selected. `--safe` is the answer when that
+  matters, and the console-script case is in ROADMAP.md.
 - Node narrowing reads names, so it cannot see through `getattr`, string
   dispatch, or a module named only by a string (`pytest.importorskip("x")`).
   It sees `globals`, `eval`, `exec`, `request.getfixturevalue`, star imports of

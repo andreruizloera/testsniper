@@ -29,7 +29,10 @@ after that: its previous content comes from git, the fixture graph is built
 from both versions, and only the fixtures the diff moved select tests. A
 changed TEST file is read the same way now, so it no longer runs in full: the
 tests its diff moved are selected, and a helper or fixture it moved selects
-the tests that read them. The items below are what none of that does yet.
+the tests that read them. Most recently, a `python -m <module>` subprocess is
+followed as a dependency, so a command-line end-to-end test that imports none
+of the code it exercises is selected when that code changes. The items below
+are what none of that does yet.
 
 - Diff a changed conftest or test file against more than one revision, so one
   edited in an earlier commit is read as changed too. Today the comparison is
@@ -62,16 +65,36 @@ the tests that read them. The items below are what none of that does yet.
   graph already does for exactly this reason. And a module-level statement
   that reads something affected currently blocks the whole module, where only
   the names that statement binds are really at risk.
-- Decide what to do about `if __name__ == "__main__":`. It is module-level
-  code, so a guard body whose call graph reaches the change makes the whole
-  module unnarrowable, and running testsniper on testsniper shows it costing
-  exactly that on `cli.py` and `__main__.py`. The body does not run on import,
-  which is an argument for skipping it. What stops that from being obviously
-  right is that a test which invokes the module as a SUBPROCESS does run it,
-  and this repository's own CLI tests are that shape, so skipping it would
-  trade a safe over-selection for an under-selection in the case most likely
-  to be affected. Needs a way to see a subprocess invocation, or a decision
-  that this over-selection is the one to keep.
+- Resolve a console script to its module, so
+  `subprocess.run(["mytool", "--flag"])` is followed the way
+  `subprocess.run([sys.executable, "-m", "mytool"])` now is. The mapping is in
+  the project's `[project.scripts]` table, which means this needs the packaging
+  metadata rather than only the AST, and it needs a rule for a script whose
+  name collides with a real executable on PATH. This is the largest remaining
+  hole in subprocess following and it is an UNDER-selection, so it is the next
+  thing worth doing here.
+- Read a `-m` target that is not a literal: a module name held in a variable,
+  built with an f-string, or assembled from a constant defined elsewhere in
+  the file. Constant folding within one module would cover most real cases.
+  Refused today rather than guessed at.
+- Decide what to do about `if __name__ == "__main__":`, which is still open,
+  but for different reasons than this file gave before subprocess following
+  shipped. The guard body is module-level code, so a guard whose call graph
+  reaches the change makes the whole module unnarrowable, and running
+  testsniper on testsniper still shows it costing exactly that on `cli.py` and
+  `__main__.py`. What this file previously said was that skipping the body
+  would trade a safe over-selection for an under-selection, "and this
+  repository's own CLI tests are that shape". **Measured, that was wrong in
+  both halves.** `tests/test_cli.py` calls `main([...])` IN PROCESS, so
+  `cli.py`'s guard never runs for it; the tests that do start a process live in
+  three other files and reach `cli.main` through `__main__.py`, whose guard is
+  the one that runs. And the over-selection was not protecting them: with the
+  guard honoured and both modules fully affected, all 22 of those tests were
+  still missed, because what was missing was the edge and not a symbol. So the
+  real question left is narrower: whether a guard body should be analyzed as
+  the entry point of the module that `python -m` executes, which would let
+  `__main__.py` narrow on the symbol the guard actually calls instead of
+  blocking.
 - Resolve `package.module.name()` attribute reads back to a symbol, so a plain
   `import package.module` can be narrowed the way `from package.module import
   name` now is. Today the attribute chain is not tracked and that import keeps
