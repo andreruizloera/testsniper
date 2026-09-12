@@ -174,3 +174,19 @@ def test_a_subprocess_to_an_unrelated_module_selects_nothing(tmp_path: Path) -> 
 
     out = _run(repo, "--list").stdout
     assert "tests/test_subprocess.py" not in out
+
+
+def test_the_reason_says_the_test_runs_the_module_rather_than_imports_it(tmp_path: Path) -> None:
+    """`python -m pkg` reaches pkg.cli through pkg/__main__.py, two steps out.
+
+    Before the reason was told apart, this line read "imports it
+    transitively" about a file whose only import is `subprocess`.
+    """
+    repo = _cli_repo(tmp_path)
+    (repo / "pkg" / "cli.py").write_text(CLI.replace('return "hello"', 'return "goodbye"'))
+
+    out = _run(repo, "--list").stdout
+    expected = (
+        "tests/test_subprocess.py  [distance 2] runs it in a subprocess, transitively (distance 2)"
+    )
+    assert expected in out

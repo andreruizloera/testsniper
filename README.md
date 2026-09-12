@@ -295,6 +295,13 @@ before run: the failures are 6 in `test_cross_module_symbols.py`, 4 in
 `test_e2e_fixture.py` and 12 in `test_e2e_mixed.py`, unchanged from the before
 run, plus 4 in the new `test_subprocess_entrypoint.py`.
 
+The reason column in that block is from the commit it was run at. Its four
+subprocess lines now read `runs it in a subprocess, transitively (distance 2)`:
+a reason saying "imports" about a file whose only import is `subprocess` was
+false, and was corrected once console scripts made the same wording appear
+about a test that imports nothing at all. A file whose own step toward the
+change is an import keeps the import wording.
+
 The reading is deliberately narrow. The call has to be named like one of the
 `subprocess` process starters (`run`, `Popen`, `call`, `check_call`,
 `check_output`, `getoutput`, `getstatusoutput`), matched on the bare name so
@@ -305,9 +312,62 @@ Only a literal `-m` followed by a literal
 module name is matched, and `python -m pkg` records
 both `pkg` and `pkg.__main__`, since that is what the interpreter runs. A
 module name held in a variable or built with an f-string is refused rather
-than guessed at, and a shell string command is not split. A console script
-invoked by name (`subprocess.run(["mytool", ...])`) is still invisible; that
-needs the project's `[project.scripts]` table and is in ROADMAP.md.
+than guessed at, and a shell string command is not split.
+
+### Tests that run the tool through its console script
+
+Most command-line tests do not spell out `python -m`. They run the name the
+tool is installed under, `subprocess.run(["mytool", "--list"])`, and that name
+is not a module. It is a program an installer generated from one line of
+packaging metadata, `mytool = "mytool.cli:main"`, whose whole job is to import
+`mytool.cli` and call `main`. testsniper reads that metadata and treats running
+the program as the import it is.
+
+Measured on a small project installed with `uv pip install -e` into a fresh
+virtualenv, so the `greet` on PATH is the installer's own wrapper. The project
+declares `greet = "pkg.cli:main"` in `[project.scripts]` and has two tests: one
+runs `subprocess.run(["greet"])` and imports nothing, the other imports an
+unrelated module. `pkg/cli.py` was changed so the script prints the wrong
+greeting. Before, at the previous commit:
+
+```text
+$ testsniper --list
+Changed: pkg/cli.py
+Selected: none
+Selected (would run 0 of 2 tests):
+Warning: no test reaches changed module pkg/cli.py
+Selection confidence: Medium
+  - no test imports these changed modules: pkg/cli.py
+```
+
+`testsniper` ran nothing and exited 0, while `pytest -q` on the same tree exited
+1 with `1 failed, 1 passed`. After:
+
+```text
+$ testsniper --list
+Changed: pkg/cli.py
+Selected: tests/test_cli_script.py
+Selected (would run 1 of 2 tests):
+  tests/test_cli_script.py  [distance 1] runs a changed module in a subprocess
+Selection confidence: High
+```
+
+`testsniper` now runs that one test, reports `1 failed`, and exits 1, and the
+whole suite still reports `1 failed, 1 passed`: the same failure.
+
+The names come from `[project.scripts]` and `[project.gui-scripts]`,
+`[tool.poetry.scripts]` (a string, or a table whose `type` is `console`), and
+`console_scripts` or `gui_scripts` under `[options.entry_points]` in
+`setup.cfg`, read from every `pyproject.toml` and `setup.cfg` in the repository
+outside the directories the scan skips. The program has to be the FIRST element
+of the command, written as a literal or passed through `shutil.which("mytool")`,
+or be a whole one-word string command. The edge then reaches as far as an
+import would: node narrowing selects the test function that starts the script,
+a helper module that starts it taints only the helper functions that do, and a
+conftest fixture that starts it selects the tests that request it. A declared
+name that is also an unrelated executable on your PATH is followed anyway,
+since the worst that costs is one test run that did not need to happen. What is
+still refused, and so still under-selects, is under Limitations.
 
 ## Quickstart
 
@@ -593,10 +653,12 @@ src/testsniper/
   gitio.py     changed files from git (working tree, staged, or vs a ref),
                and a changed file's content at the compared-against revision
   scanner.py   AST scan of every .py file: imports, star/dynamic flags,
-               and python -m subprocess targets
-  entrypoints.py  reads a `python -m <module>` target back out of a
-               subprocess argument vector, and refuses everything it
-               cannot read literally
+               python -m subprocess targets, and declared console scripts
+  entrypoints.py  reads a `python -m <module>` target or a program name
+               back out of a subprocess command, and refuses everything
+               it cannot read literally
+  scripts.py   console-script name -> module, read from every
+               pyproject.toml and setup.cfg in the repository
   graph.py     reverse import graph and BFS transitive closure
   indexer.py   test file discovery and test function counting
   selector.py  modes, conftest/config triggers, always_run, confidence,
@@ -656,14 +718,17 @@ graph on its own cannot see.
   needs `--nodes` or the plugin.
 - Static analysis: dynamic imports and plugin registries are invisible; the
   confidence rating tells you when that matters.
-- A subprocess that runs the project is followed only in the
-  `python -m <module>` form, with both `-m` and the module name written as
-  string literals in the argument vector. A console script called by name,
-  a module name held in a variable or built with an f-string, and a
-  `shell=True` string command are all invisible, and invisible here means
-  under-selection rather than over-selection: the tests that exercise your
-  command line will not be selected. `--safe` is the answer when that
-  matters, and the console-script case is in ROADMAP.md.
+- A subprocess that runs the project is followed in two forms: `python -m
+  <module>` with both `-m` and the module name written as string literals, and
+  a console script declared in `pyproject.toml` or `setup.cfg`, started by its
+  name as the first element of the command. A module or program name held in a
+  variable or built with an f-string, any string command other than a single
+  word naming a declared script, a script started through a launcher
+  (`["uv", "run", "mytool"]`) or by path, and a script declared only in
+  `setup.py` are all invisible, and invisible here means under-selection rather
+  than over-selection: the tests that exercise your command line will not be
+  selected. `--safe` is the answer when that matters, and the launcher and path
+  cases are in ROADMAP.md.
 - Node narrowing reads names, so it cannot see through `getattr`, string
   dispatch, or a module named only by a string (`pytest.importorskip("x")`).
   It sees `globals`, `eval`, `exec`, `request.getfixturevalue`, star imports of

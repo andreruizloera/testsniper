@@ -7,12 +7,13 @@ from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
 from testsniper.config import Config
+from testsniper.entrypoints import program_target
 from testsniper.fixtures import FixtureVerdict, analyze_conftests, conftests_for, file_requests
 from testsniper.graph import build_reverse_graph, importers_of, reverse_closure
 from testsniper.indexer import count_tests_in_file, index_tests, is_test_file, path_is_under
 from testsniper.scanner import ModuleInfo, module_name, scan_repo
 from testsniper.symbols import ModuleSymbols, changed_symbols, propagate_symbols
-from testsniper.usage import package_parts
+from testsniper.usage import is_affected, package_parts
 
 Mode = Literal["safe", "default", "aggressive"]
 
@@ -229,6 +230,30 @@ def select(
     sel.affected_files = set(dist)
     sel.affected_modules = {infos[rel].module for rel in dist if rel in infos}
     sel.affected_modules |= {module_name(root, Path(rel)) for rel in deleted}
+    # A console script is not a module, so nothing in the closure carries its
+    # name. Its program entry stands for "running this program imports
+    # something affected", which is the question collect_usage asks when it
+    # meets the name in a command. The scan already resolved each name to
+    # the modules the packaging metadata points it at, and the test for
+    # "affected" is the one a `python -m` target of those modules gets.
+    for info in infos.values():
+        for program, modules in info.programs.items():
+            if any(is_affected(m, sel.affected_modules, with_prefixes=True) for m in modules):
+                sel.affected_modules.add(program_target(program))
+
+    by_name: dict[str, set[str]] = {}
+    for path, found in infos.items():
+        by_name.setdefault(found.module, set()).add(path)
+
+    def one_hop_closer(rel: str, names: set[str], d: int) -> bool:
+        """Whether one of ``names`` is a file one step nearer the change."""
+        return any(
+            dist.get(target) == d - 1
+            for name in names
+            for target in by_name.get(name, ())
+            if target != rel
+        )
+
     for rel, d in dist.items():
         if rel not in test_set:
             continue
@@ -236,8 +261,30 @@ def select(
             continue
         if d == 0:
             add(rel, 0, "changed test file")
-        elif d == 1:
-            add(rel, 1, "imports a changed module")
+            continue
+        # A test that reaches the change only by STARTING a process imports
+        # nothing, and a reason that said "imports" about it would be false.
+        # It counts as that only when no import makes the same step.
+        found = infos.get(rel)
+        by_process = (
+            found is not None
+            and one_hop_closer(rel, found.subprocess_deps, d)
+            and not one_hop_closer(
+                rel,
+                (found.deps - found.subprocess_deps) | found.star_imports | found.candidates,
+                d,
+            )
+        )
+        if d == 1:
+            add(
+                rel,
+                1,
+                "runs a changed module in a subprocess"
+                if by_process
+                else "imports a changed module",
+            )
+        elif by_process:
+            add(rel, d, f"runs it in a subprocess, transitively (distance {d})")
         else:
             add(rel, d, f"imports it transitively (distance {d})")
 

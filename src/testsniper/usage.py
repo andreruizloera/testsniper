@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-from testsniper.entrypoints import subprocess_modules
+from testsniper.entrypoints import program_target, subprocess_modules, subprocess_programs
 from testsniper.scanner import resolve_from
 
 # Dotted module name -> the symbols in it a change reaches. A module that is
@@ -186,7 +186,8 @@ def collect_usage(
     resolve later, and ``pytest.mark.usefixtures("x")`` contributes ``x``,
     since that mark requests a fixture the parameter list never mentions. A
     local import of an affected module contributes LOCAL_IMPORT, and a
-    ``python -m`` subprocess that runs one contributes SUBPROCESS_ENTRY.
+    ``python -m`` subprocess or a console script that runs one contributes
+    SUBPROCESS_ENTRY.
     """
     usage = Usage()
     for child in ast.walk(node):
@@ -209,11 +210,14 @@ def collect_usage(
             # Running the project as a process reaches its code without
             # binding any name, so it gets the same sentinel treatment as a
             # function-local import. `with_prefixes` is on because
-            # `python -m a.b` executes package `a` on the way to `a.b`.
+            # `python -m a.b` executes package `a` on the way to `a.b`. A
+            # console script is matched by its program entry instead, which the
+            # selector puts in `affected` when a module the script imports is
+            # affected, so this function never needs the packaging metadata.
             if any(
                 is_affected(target, affected, with_prefixes=True)
                 for target in subprocess_modules(child)
-            ):
+            ) or any(program_target(name) in affected for name in subprocess_programs(child)):
                 usage.names.add(SUBPROCESS_ENTRY)
         elif isinstance(child, ast.Import):
             for alias in child.names:

@@ -5,10 +5,12 @@ Walks every Python file in the repository, records what each file imports
 constructs that static analysis cannot fully trace: star imports, dynamic
 imports (importlib.import_module / __import__), and files that fail to parse.
 
-It also records one dependency that is not an import at all: a
-``python -m pkg`` subprocess, which is how a test exercises a command
-line rather than a function. See ``entrypoints.py`` for what that reads
-and, more importantly, what it refuses to read.
+It also records one dependency that is not an import at all: a subprocess
+that runs the project, which is how a test exercises a command line rather
+than a function. It is followed in two forms, ``python -m pkg`` and a
+console script the repository's packaging metadata declares. See
+``entrypoints.py`` and ``scripts.py`` for what those read and, more
+importantly, what they refuse to read.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from testsniper.entrypoints import subprocess_modules
+from testsniper.entrypoints import subprocess_modules, subprocess_programs
+from testsniper.scripts import Scripts, load_scripts
 
 SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -51,6 +54,12 @@ class ModuleInfo:
     candidates: set[str] = field(default_factory=set)
     star_imports: set[str] = field(default_factory=set)
     subprocess_modules: set[str] = field(default_factory=set)
+    # Program name -> the modules its console script imports, for every
+    # subprocess in this file that starts a script the repository declares.
+    programs: dict[str, frozenset[str]] = field(default_factory=dict)
+    # The names in ``deps`` this file reaches ONLY by starting a process, so
+    # the output can say "runs" rather than "imports" about such an edge.
+    subprocess_deps: set[str] = field(default_factory=set)
     dynamic_import: bool = False
     parse_error: bool = False
     unresolved_relative: bool = False
@@ -86,8 +95,14 @@ def _expand_prefixes(dotted: str) -> set[str]:
     return {".".join(parts[:i]) for i in range(1, len(parts) + 1)}
 
 
-def parse_module(root: Path, relpath: Path) -> ModuleInfo:
-    """Parse one file and extract its import facts."""
+def parse_module(root: Path, relpath: Path, scripts: Scripts | None = None) -> ModuleInfo:
+    """Parse one file and extract its import facts.
+
+    ``scripts`` maps console-script names to the modules they import. A
+    subprocess that starts one records an edge to those modules, the same
+    edge a ``python -m`` target records; without it, program names are
+    ignored.
+    """
     info = ModuleInfo(relpath=str(PurePosixPath(relpath)), module=module_name(root, relpath))
     try:
         source = (root / relpath).read_text(encoding="utf-8", errors="replace")
@@ -100,17 +115,19 @@ def parse_module(root: Path, relpath: Path) -> ModuleInfo:
     is_package = relpath.name == "__init__.py"
     pkg_parts = mod_parts if is_package else mod_parts[:-1]
 
+    imported: set[str] = set()
+    through_process: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                info.deps |= _expand_prefixes(alias.name)
+                imported |= _expand_prefixes(alias.name)
         elif isinstance(node, ast.ImportFrom):
             full, unresolved = resolve_from(node, pkg_parts)
             if unresolved:
                 info.unresolved_relative = True
             if full is None:
                 continue
-            info.deps |= _expand_prefixes(full)
+            imported |= _expand_prefixes(full)
             for alias in node.names:
                 if alias.name == "*":
                     info.star_imports.add(full)
@@ -127,7 +144,18 @@ def parse_module(root: Path, relpath: Path) -> ModuleInfo:
             # reverse graph treats it as the edge it is.
             for target in subprocess_modules(node):
                 info.subprocess_modules.add(target)
-                info.deps |= _expand_prefixes(target)
+                through_process |= _expand_prefixes(target)
+            # So is a console script, resolved here rather than in
+            # entrypoints.py because only the metadata knows what it imports.
+            for program in subprocess_programs(node):
+                modules = scripts.get(program) if scripts else None
+                if not modules:
+                    continue
+                info.programs[program] = modules
+                for module in modules:
+                    through_process |= _expand_prefixes(module)
+    info.deps = imported | through_process
+    info.subprocess_deps = through_process - imported
     return info
 
 
@@ -151,8 +179,14 @@ def resolve_from(node: ast.ImportFrom, pkg_parts: list[str]) -> tuple[str | None
     return ".".join(target), False
 
 
-def scan_repo(root: Path) -> dict[str, ModuleInfo]:
-    """Scan every Python file under root, keyed by POSIX relative path."""
+def scan_repo(root: Path, scripts: Scripts | None = None) -> dict[str, ModuleInfo]:
+    """Scan every Python file under root, keyed by POSIX relative path.
+
+    ``scripts`` defaults to the console scripts declared anywhere in the
+    repository outside the skipped directories.
+    """
+    if scripts is None:
+        scripts = load_scripts(root, SKIP_DIRS)
     infos: dict[str, ModuleInfo] = {}
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
@@ -160,6 +194,6 @@ def scan_repo(root: Path) -> dict[str, ModuleInfo]:
             continue
         if not path.is_file():
             continue
-        info = parse_module(root, rel)
+        info = parse_module(root, rel, scripts)
         infos[info.relpath] = info
     return infos

@@ -65,14 +65,21 @@ are what none of that does yet.
   graph already does for exactly this reason. And a module-level statement
   that reads something affected currently blocks the whole module, where only
   the names that statement binds are really at risk.
-- Resolve a console script to its module, so
-  `subprocess.run(["mytool", "--flag"])` is followed the way
-  `subprocess.run([sys.executable, "-m", "mytool"])` now is. The mapping is in
-  the project's `[project.scripts]` table, which means this needs the packaging
-  metadata rather than only the AST, and it needs a rule for a script whose
-  name collides with a real executable on PATH. This is the largest remaining
-  hole in subprocess following and it is an UNDER-selection, so it is the next
-  thing worth doing here.
+- Follow a console script started through a launcher or by path, which is
+  the part of subprocess following still refused. Resolving a script NAME to
+  its module shipped: `subprocess.run(["mytool", "--flag"])` is followed
+  through `[project.scripts]`, `[project.gui-scripts]`,
+  `[tool.poetry.scripts]` and `setup.cfg`, and a declared name that collides
+  with a real executable on PATH is followed anyway, because the cost of that
+  is one unnecessary test run. Still invisible, and still an UNDER-selection:
+  a launcher that puts the script in a later position (`["uv", "run",
+  "mytool"]`, `["pipx", "run", "mytool"]`, `["hatch", "run", "mytool"]`); a
+  script started by path (`str(venv / "bin" / "mytool")`,
+  `sysconfig.get_path("scripts")`); and a script declared only in `setup.py`,
+  which is code. The launcher case wants a short list of launchers and the
+  position each one puts the program in, not a reading of every position,
+  which would bind a test to every declared name it merely passes as an
+  argument.
 - Read a `-m` target that is not a literal: a module name held in a variable,
   built with an f-string, or assembled from a constant defined elsewhere in
   the file. Constant folding within one module would cover most real cases.
