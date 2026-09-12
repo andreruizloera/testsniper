@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Demo, in seven parts.
+# Demo, in eight parts.
 #
 # Part 1 uses the generated fixture project (402 tests) to show file-level
 # selection: change one module, run only the test files that can reach it.
@@ -26,6 +26,10 @@
 # Part 7 shows the unit below the module: a change to one symbol of a changed
 # module does not reach a test that imports a different symbol of it, and a
 # function nothing calls reaches no existing test at all.
+#
+# Part 8 shows a test that reaches the code only by running its console
+# script. It imports nothing; the link is one line of packaging metadata, and
+# the selected test is run so the failure it catches is shown, not assumed.
 #
 # Every change below edits an EXISTING definition unless a part is about
 # adding one, because appending an inert function is now correctly a change
@@ -226,6 +230,48 @@ echo "\$ testsniper --nodes --list   # after APPENDING a function to store/prici
 added_fn_out="$(testsniper --nodes --list)"
 echo "$added_fn_out"
 
+echo
+echo "### Part 8: a test that runs the tool through its console script"
+echo
+echo "tests/test_cli_script.py runs subprocess.run([\"greet\"]) and imports nothing."
+echo "Its only link to pkg/cli.py is greet = \"pkg.cli:main\" in pyproject.toml,"
+echo "and testsniper reads that line, so changing pkg/cli.py selects the test."
+echo
+setup script_project
+# The wrapper an installer writes for that line, the same one
+# tests/test_console_script_entrypoint.py uses, so the test really starts the
+# script. It lives outside the repository, as an installed script would.
+mkdir -p "$tmp/bin"
+cat >"$tmp/bin/greet" <<EOF
+#!$(command -v python)
+import sys
+
+from pkg.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+chmod +x "$tmp/bin/greet"
+script_env=(env "PATH=$tmp/bin:$PATH" "PYTHONPATH=$PWD")
+# Control: before the change both tests pass, so a failure below cannot be a
+# script that was never found.
+script_control="$("${script_env[@]}" python -m pytest -q -p no:cacheprovider)"
+python - <<'EOF'
+import pathlib
+
+path = pathlib.Path("pkg/cli.py")
+path.write_text(path.read_text().replace('print("hello")', 'print("goodbye")'))
+EOF
+echo "\$ testsniper --list   # after changing what pkg/cli.py prints"
+script_out="$("${script_env[@]}" testsniper --list)"
+echo "$script_out"
+echo
+echo "\$ testsniper"
+script_status=0
+script_run="$("${script_env[@]}" testsniper 2>&1)" || script_status=$?
+echo "$script_run"
+echo "(exit $script_status)"
+
 # The README pastes these lines. Fail loudly rather than let them drift.
 expect() {
     if ! printf '%s' "$1" | grep -qF -- "$2"; then
@@ -276,5 +322,19 @@ expect "$added_fn_out" "Selected: tests/test_checkout.py"
 expect "$added_fn_out" "0 of 13 tests: narrowed by name usage"
 expect_absent "$added_fn_out" "test_price_with_tax_rounds_half_up"
 expect_absent "$added_fn_out" "test_line_total_multiplies"
+expect "$script_control" "2 passed"
+expect "$script_out" "Changed: pkg/cli.py"
+expect "$script_out" "Selected (would run 1 of 2 tests):"
+expect "$script_out" \
+    "tests/test_cli_script.py  [distance 1] runs a changed module in a subprocess"
+expect_absent "$script_out" "tests/test_other.py"
+expect "$script_run" "1 failed"
+# The failure has to be the changed greeting, not a script that did not start.
+expect "$script_run" "goodbye"
+if [ "$script_status" -ne 1 ]; then
+    echo
+    echo "DEMO FAILED: testsniper exited $script_status on a failing selection, expected 1"
+    exit 1
+fi
 echo
 echo "Demo checks passed."

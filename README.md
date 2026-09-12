@@ -355,6 +355,15 @@ Selection confidence: High
 `testsniper` now runs that one test, reports `1 failed`, and exits 1, and the
 whole suite still reports `1 failed, 1 passed`: the same failure.
 
+The after half is also part 8 of `demo.sh`, so CI re-runs it on every push, on
+the same layout in `examples/script_project`. There the `greet` wrapper is
+written by the demo, the way this project's own tests write it, rather than by
+an installer. The demo fails the build if `Changed: pkg/cli.py`,
+`Selected (would run 1 of 2 tests):` or the reason line above changes, if
+`tests/test_other.py` is selected, if both tests do not pass before the change,
+or if the selected run does not fail on the changed greeting and exit 1. The
+before half was measured once, as described, and is not re-run.
+
 The names come from `[project.scripts]` and `[project.gui-scripts]`,
 `[tool.poetry.scripts]` (a string, or a table whose `type` is `console`), and
 `console_scripts` or `gui_scripts` under `[options.entry_points]` in
@@ -378,7 +387,7 @@ uv sync
 uv run bash demo.sh
 ```
 
-The demo runs in six parts. Part 1 copies the generated example project (40
+The demo runs in eight parts. Part 1 copies the generated example project (40
 modules, 402 tests) to a temp directory, edits one module, and shows the
 default, `--aggressive`, and `--safe --list` selections. Part 2 copies the
 mixed example project, edits `store/pricing.py`, and shows the same change
@@ -389,8 +398,12 @@ whole directory selected with the reason. Part 5 edits the `conftest.py`
 itself, once in a fixture body and once in a comment, and shows the first
 selecting two tests and the second selecting none. Part 6 edits a test file
 itself, once by adding a test and once by editing a helper method inside a
-class, and shows one test selected and then two. The script checks the lines
-this README pastes and exits nonzero if any of them has drifted.
+class, and shows one test selected and then two. Part 7 appends a new function
+to `store/pricing.py` and shows that it reaches no existing test, since nothing
+calls it. Part 8 copies `examples/script_project`, changes what its `greet`
+console script prints, and shows the one test that runs `greet` selected and
+failing, although it imports nothing from the project. The script checks the
+lines this README pastes and exits nonzero if any of them has drifted.
 
 ## Why?
 
